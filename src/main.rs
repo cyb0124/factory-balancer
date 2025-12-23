@@ -3,7 +3,8 @@
 mod format;
 
 use crate::format::format_float;
-use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Layout, Modal, Pos2, TextEdit, ThemePreference, TopBottomPanel, Ui, Vec2, vec2};
+use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Pos2, Ui, Vec2, vec2};
+use eframe::egui::{KeyboardShortcut, Layout, Modifiers, TextEdit, ThemePreference, TopBottomPanel};
 use eframe::{CreationContext, NativeOptions, run_native};
 use egui_file_dialog::{DialogState, FileDialog};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
@@ -12,6 +13,8 @@ use meval::eval_str;
 use serde::{Deserialize, Serialize};
 use std::fs::{read_to_string, write};
 use std::{cell::LazyCell, collections::HashMap};
+
+const THRESHOLD: f64 = 1E-9;
 
 #[derive(Serialize, Deserialize)]
 enum NodeMeta {
@@ -201,9 +204,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         match stats {
             NodeStats::Process(valid) => _ = (!valid).then(|| frame.fill = Color32::DARK_RED),
             NodeStats::Resource(rate) => {
-                if *rate < -1E-20 {
+                if *rate < -THRESHOLD {
                     frame.fill = Color32::from_rgb(160, 80, 0);
-                } else if *rate > 1E-20 {
+                } else if *rate > THRESHOLD {
                     frame.fill = Color32::DARK_GREEN;
                 }
             }
@@ -216,7 +219,12 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         match &mut chart[node] {
             NodeMeta::Resource(_) => {
                 ui.set_width(72.);
-                ui.vertical_centered(|ui| ui.label(format_float(self.stats.resource_rate(node))));
+                let rate = match self.stats.resource_rate(node) {
+                    0. => "0".to_owned(),
+                    x if x.abs() < THRESHOLD => "≈0".to_owned(),
+                    x => format_float(x),
+                };
+                ui.vertical_centered(|ui| ui.label(rate));
             }
             NodeMeta::Process(meta) => {
                 ui.set_width(100.);
@@ -369,14 +377,14 @@ impl eframe::App for App {
         TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.path);
-                ui.button("Load").clicked().then(|| {
+                (ui.button("Load").clicked() || ui.input_mut(|x| x.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::R)))).then(|| {
                     if self.path.is_empty() {
                         self.pick_file(false, |app| app.do_load());
                     } else {
                         self.do_load();
                     }
                 });
-                ui.button("Save").clicked().then(|| {
+                (ui.button("Save").clicked() || ui.input_mut(|x| x.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::S)))).then(|| {
                     if self.path.is_empty() {
                         self.pick_file(true, |app| app.do_save());
                     } else {

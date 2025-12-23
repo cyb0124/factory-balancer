@@ -1,7 +1,7 @@
 use std::slice;
 
-fn format_decimal(mut value: u64, mut scale: i32) -> String {
-    let true = value > 0 else { return "0 ".to_owned() };
+fn format_decimal(mut value: u64, mut scale: i32, neg: bool) -> String {
+    let true = value > 0 else { return "0".to_owned() };
     while value % 10 == 0 {
         value /= 10;
         scale += 1;
@@ -22,7 +22,7 @@ fn format_decimal(mut value: u64, mut scale: i32) -> String {
         0 => "",
         -2 => "μ",
         x if x > 0 => {
-            let Some(c) = b"kMGTPEZYRQ".get((x - 1) as usize) else { return "≈∞".to_owned() };
+            let Some(c) = b"kMGTPEZYRQ".get((x - 1) as usize) else { return if neg { "≈-∞" } else { "≈∞" }.to_owned() };
             unsafe { str::from_utf8_unchecked(slice::from_ref(c)) }
         }
         x => {
@@ -36,7 +36,7 @@ fn format_decimal(mut value: u64, mut scale: i32) -> String {
         frac /= 10;
         places -= 1;
     }
-    format!("{int}.{frac:0places$} {prefix}")
+    format!("{}{int}.{frac:0places$} {prefix}", if neg { "-" } else { "" })
 }
 
 fn approx_decimal(mut value: f64) -> (u64, i32) {
@@ -51,6 +51,5 @@ fn approx_decimal(mut value: f64) -> (u64, i32) {
 
 pub fn format_float(float: f64) -> String {
     let (value, scale) = approx_decimal(float.abs());
-    let abs = format_decimal(value, scale);
-    if float < 0. { format!("-{abs}") } else { abs }
+    format_decimal(value, scale, float < 0.)
 }
