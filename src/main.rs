@@ -324,6 +324,44 @@ impl App {
             !resp.should_close()
         }));
     }
+
+    fn do_load(&mut self) {
+        match try {
+            let data = read_to_string(&self.path).map_err(|e| e.to_string())?;
+            ron::from_str(&data).map_err(|e| e.to_string())?
+        } {
+            Ok(chart) => self.chart = chart,
+            Err(e) => self.alert(e),
+        }
+    }
+
+    fn do_save(&mut self) {
+        if let Err(e) = try {
+            let data = ron::to_string(&self.chart).map_err(|e| e.to_string())?;
+            write(&self.path, data).map_err(|e| e.to_string())?
+        } {
+            self.alert(e);
+        }
+    }
+
+    fn pick_file(&mut self, save: bool, then: impl Fn(&mut App) + 'static) {
+        let (name, ext) = ("Plain Text", "txt");
+        let mut dialog = FileDialog::new().add_file_filter_extensions(name, vec![ext]);
+        if save {
+            dialog = dialog.add_save_extension(name, ext).default_save_extension(name);
+            dialog.save_file();
+        } else {
+            dialog.pick_file();
+        }
+        self.modal = Some(Box::new(move |app, ctx| {
+            dialog.update(ctx);
+            if let Some(picked) = dialog.take_picked() {
+                app.path = picked.to_string_lossy().into_owned();
+                then(app);
+            }
+            matches!(dialog.state(), DialogState::Open)
+        }));
+    }
 }
 
 impl eframe::App for App {
@@ -331,32 +369,18 @@ impl eframe::App for App {
         TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.path);
-                ui.button("Pick").clicked().then(|| {
-                    let mut dialog = FileDialog::new().add_file_filter_extensions("Plain Text", vec!["txt"]);
-                    dialog.save_file();
-                    self.modal = Some(Box::new(move |app, ctx| {
-                        dialog.update(ctx);
-                        if let Some(picked) = dialog.take_picked() {
-                            app.path = picked.to_string_lossy().into_owned();
-                        }
-                        matches!(dialog.state(), DialogState::Open)
-                    }));
-                });
                 ui.button("Load").clicked().then(|| {
-                    match try {
-                        let data = read_to_string(&self.path).map_err(|e| e.to_string())?;
-                        ron::from_str(&data).map_err(|e| e.to_string())?
-                    } {
-                        Ok(chart) => self.chart = chart,
-                        Err(e) => self.alert(e),
+                    if self.path.is_empty() {
+                        self.pick_file(false, |app| app.do_load());
+                    } else {
+                        self.do_load();
                     }
                 });
                 ui.button("Save").clicked().then(|| {
-                    if let Err(e) = try {
-                        let data = ron::to_string(&self.chart).map_err(|e| e.to_string())?;
-                        write(&self.path, data).map_err(|e| e.to_string())?
-                    } {
-                        self.alert(e);
+                    if self.path.is_empty() {
+                        self.pick_file(true, |app| app.do_save());
+                    } else {
+                        self.do_save();
                     }
                 });
             });
