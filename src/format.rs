@@ -49,7 +49,8 @@ fn approx_decimal(mut value: f64) -> (u64, i32) {
     ((value + 0.5) as u64, scale)
 }
 
-pub fn format_float(value: f64) -> String {
-    let (value, scale) = approx_decimal(value);
-    format_decimal(value, scale)
+pub fn format_float(float: f64) -> String {
+    let (value, scale) = approx_decimal(float.abs());
+    let abs = format_decimal(value, scale);
+    if float < 0. { format!("-{abs}") } else { abs }
 }
