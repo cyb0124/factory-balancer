@@ -30,13 +30,14 @@ fn format_decimal(mut value: u64, mut scale: i32, neg: bool) -> String {
             unsafe { str::from_utf8_unchecked(slice::from_ref(c)) }
         }
     };
-    let true = frac > 0 else { return format!("{int} {prefix}") };
+    let neg = if neg { "-" } else { "" };
+    let true = frac > 0 else { return format!("{neg}{int} {prefix}") };
     let mut places = 3;
     while frac % 10 == 0 {
         frac /= 10;
         places -= 1;
     }
-    format!("{}{int}.{frac:0places$} {prefix}", if neg { "-" } else { "" })
+    format!("{neg}{int}.{frac:0places$} {prefix}")
 }
 
 fn approx_decimal(mut value: f64) -> (u64, i32) {

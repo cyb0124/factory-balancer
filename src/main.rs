@@ -25,8 +25,8 @@ enum NodeMeta {
 #[derive(Serialize, Deserialize)]
 struct ProcessMeta {
     label: String,
-    activity: String,
     capacity: String,
+    activity: String,
     speed: String,
     consumes: Vec<String>,
     produces: Vec<String>,
@@ -43,13 +43,11 @@ enum NodeStats {
 
 impl ProcessMeta {
     fn common_rate(&self) -> Option<f64> {
-        let mut activity = eval_str(&self.activity).ok()?;
-        let speed = eval_str(&self.speed).ok()?;
-        if !self.capacity.is_empty() {
-            let capacity = eval_str(&self.capacity).ok()?;
-            activity = activity.min(capacity);
+        let mut rate = eval_str(&self.capacity).ok()?;
+        if !self.activity.is_empty() {
+            rate = rate.min(eval_str(&self.activity).ok()?);
         }
-        Some(speed * activity.max(0.))
+        Some(rate * eval_str(&self.speed).ok()?)
     }
 }
 
@@ -230,12 +228,12 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 ui.set_width(100.);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Act");
-                        TextEdit::singleline(&mut meta.activity).desired_width(f32::INFINITY).show(ui);
-                    });
-                    ui.horizontal(|ui| {
                         ui.label("Cap");
                         TextEdit::singleline(&mut meta.capacity).desired_width(f32::INFINITY).show(ui);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Act");
+                        TextEdit::singleline(&mut meta.activity).desired_width(f32::INFINITY).show(ui);
                     });
                     ui.horizontal(|ui| {
                         ui.label("Spd");
@@ -302,8 +300,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         ui.button("New Process").clicked().then(|| {
             let meta = ProcessMeta {
                 label: String::new(),
-                activity: "1".to_owned(),
-                capacity: String::new(),
+                capacity: "1".to_owned(),
+                activity: String::new(),
                 speed: "1".to_owned(),
                 consumes: vec!["1".to_owned()],
                 produces: vec!["1".to_owned()],
