@@ -1,7 +1,7 @@
 mod format;
 
 use core::f32;
-use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Layout, Modal, Pos2, RichText, TextEdit, ThemePreference, Ui, Vec2, vec2};
+use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Layout, Modal, Pos2, TextEdit, ThemePreference, Ui, Vec2, vec2};
 use eframe::{CreationContext, NativeOptions, run_native};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
@@ -17,7 +17,8 @@ enum NodeMeta {
 
 struct ProcessMeta {
     label: String,
-    count: String,
+    activity: String,
+    capacity: String,
     speed: String,
     consumes: Vec<String>,
     produces: Vec<String>,
@@ -39,28 +40,42 @@ impl ChartStats {
             let NodeMeta::Process(meta) = &meta else { continue };
             let mut adjs = Vec::with_capacity(meta.consumes.len() + meta.produces.len());
             let mut valid = false;
-            'valid: {
-                let Ok(count) = eval_str(&meta.count) else { break 'valid };
-                let Ok(speed) = eval_str(&meta.speed) else { break 'valid };
-                let mult = speed * count;
+            'fail: {
+                let Ok(mut activity) = eval_str(&meta.activity) else { break 'fail };
+                let Ok(speed) = eval_str(&meta.speed) else { break 'fail };
+                if !meta.capacity.is_empty() {
+                    let Ok(capacity) = eval_str(&meta.capacity) else { break 'fail };
+                    activity = activity.min(capacity);
+                }
+                let mult = speed * activity.max(0.);
+                valid = true;
                 for (input, qty) in meta.consumes.iter().enumerate() {
-                    let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else { break 'valid };
-                    let Ok(qty) = eval_str(qty) else { break 'valid };
+                    let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else {
+                        valid = false;
+                        continue;
+                    };
+                    let Ok(qty) = eval_str(qty) else {
+                        valid = false;
+                        continue;
+                    };
                     adjs.push((adj.node, -mult * qty));
                 }
                 for (output, qty) in meta.produces.iter().enumerate() {
-                    let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else { break 'valid };
-                    let Ok(qty) = eval_str(qty) else { break 'valid };
+                    let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else {
+                        valid = false;
+                        continue;
+                    };
+                    let Ok(qty) = eval_str(qty) else {
+                        valid = false;
+                        continue;
+                    };
                     adjs.push((adj.node, mult * qty));
                 }
-                valid = true;
             }
             this.nodes.insert(node, NodeStats::Process(valid));
-            if valid {
-                for (node, rate) in adjs {
-                    let NodeStats::Resource(total) = this.nodes.entry(node).or_insert_with(|| NodeStats::Resource(0.)) else { unreachable!() };
-                    *total += rate;
-                }
+            for (node, rate) in adjs {
+                let NodeStats::Resource(total) = this.nodes.entry(node).or_insert_with(|| NodeStats::Resource(0.)) else { unreachable!() };
+                *total += rate;
             }
         }
         this
@@ -133,9 +148,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
         let (width, label) = match &mut chart[node] {
             NodeMeta::Resource(label) => (80., label),
             NodeMeta::Process(meta) => {
-                let mut width = 80.;
-                (!meta.consumes.is_empty()).then(|| width += 50.);
-                (!meta.produces.is_empty()).then(|| width += 50.);
+                let mut width = 108.;
+                (!meta.consumes.is_empty()).then(|| width += 36.);
+                (!meta.produces.is_empty()).then(|| width += 36.);
                 (width, &mut meta.label)
             }
         };
@@ -169,8 +184,12 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
                 ui.set_width(100.);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Qty");
-                        TextEdit::singleline(&mut meta.count).desired_width(f32::INFINITY).show(ui);
+                        ui.label("Act");
+                        TextEdit::singleline(&mut meta.activity).desired_width(f32::INFINITY).show(ui);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cap");
+                        TextEdit::singleline(&mut meta.capacity).desired_width(f32::INFINITY).show(ui);
                     });
                     ui.horizontal(|ui| {
                         ui.label("Spd");
@@ -237,7 +256,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
         ui.button("New Process").clicked().then(|| {
             let meta = ProcessMeta {
                 label: String::new(),
-                count: "1".to_owned(),
+                activity: "1".to_owned(),
+                capacity: String::new(),
                 speed: "1".to_owned(),
                 consumes: vec!["1".to_owned()],
                 produces: vec!["1".to_owned()],
