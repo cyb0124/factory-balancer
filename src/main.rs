@@ -33,6 +33,18 @@ enum NodeStats {
     Process(/** valid */ bool),
 }
 
+impl ProcessMeta {
+    fn common_rate(&self) -> Option<f64> {
+        let mut activity = eval_str(&self.activity).ok()?;
+        let speed = eval_str(&self.speed).ok()?;
+        if !self.capacity.is_empty() {
+            let capacity = eval_str(&self.capacity).ok()?;
+            activity = activity.min(capacity);
+        }
+        Some(speed * activity.max(0.))
+    }
+}
+
 impl ChartStats {
     fn compute(chart: &Snarl<NodeMeta>) -> Self {
         let mut this = Self { nodes: HashMap::new() };
@@ -40,14 +52,7 @@ impl ChartStats {
             let NodeMeta::Process(meta) = &meta else { continue };
             let mut adjs = Vec::with_capacity(meta.consumes.len() + meta.produces.len());
             let mut valid = false;
-            'fail: {
-                let Ok(mut activity) = eval_str(&meta.activity) else { break 'fail };
-                let Ok(speed) = eval_str(&meta.speed) else { break 'fail };
-                if !meta.capacity.is_empty() {
-                    let Ok(capacity) = eval_str(&meta.capacity) else { break 'fail };
-                    activity = activity.min(capacity);
-                }
-                let mult = speed * activity.max(0.);
+            if let Some(rate) = meta.common_rate() {
                 valid = true;
                 for (input, qty) in meta.consumes.iter().enumerate() {
                     let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else {
@@ -58,7 +63,7 @@ impl ChartStats {
                         valid = false;
                         continue;
                     };
-                    adjs.push((adj.node, -mult * qty));
+                    adjs.push((adj.node, -rate * qty));
                 }
                 for (output, qty) in meta.produces.iter().enumerate() {
                     let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else {
@@ -69,7 +74,7 @@ impl ChartStats {
                         valid = false;
                         continue;
                     };
-                    adjs.push((adj.node, mult * qty));
+                    adjs.push((adj.node, rate * qty));
                 }
             }
             this.nodes.insert(node, NodeStats::Process(valid));
