@@ -1,14 +1,12 @@
 mod format;
 
-use core::f32;
+use crate::format::format_float;
 use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Layout, Modal, Pos2, TextEdit, ThemePreference, Ui, Vec2, vec2};
 use eframe::{CreationContext, NativeOptions, run_native};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use meval::eval_str;
-use std::{collections::HashMap, mem::take};
-
-use crate::format::format_float;
+use std::{cell::LazyCell, collections::HashMap, mem::take};
 
 enum NodeMeta {
     Resource(/** label */ String),
@@ -89,6 +87,48 @@ impl ChartStats {
     fn resource_rate(&self, node: NodeId) -> f64 { if let Some(NodeStats::Resource(rate)) = self.nodes.get(&node) { *rate } else { 0. } }
 }
 
+fn resource_rate_excl_process(chart: &Snarl<NodeMeta>, r: NodeId, p: NodeId) -> f64 {
+    let mut result = 0.;
+    'outer: for (node, meta) in chart.node_ids() {
+        let false = node == p else { continue };
+        let NodeMeta::Process(meta) = &meta else { continue };
+        let rate = LazyCell::new(|| meta.common_rate());
+        for (input, qty) in meta.consumes.iter().enumerate() {
+            let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else { continue };
+            let true = adj.node == r else { continue };
+            let Ok(qty) = eval_str(qty) else { continue };
+            let Some(rate) = *rate else { continue 'outer };
+            result -= rate * qty;
+        }
+        for (output, qty) in meta.produces.iter().enumerate() {
+            let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else { continue };
+            let true = adj.node == r else { continue };
+            let Ok(qty) = eval_str(qty) else { continue };
+            let Some(rate) = *rate else { continue 'outer };
+            result += rate * qty;
+        }
+    }
+    result
+}
+
+fn fit_activity_to_input(chart: &Snarl<NodeMeta>, pin: InPinId) -> Option<f64> {
+    let NodeMeta::Process(meta) = &chart[pin.node] else { unreachable!() };
+    let speed = eval_str(&meta.speed).ok()?;
+    let qty = eval_str(&meta.consumes[pin.input]).ok()?;
+    let [r] = <[OutPinId; 1]>::try_from(chart.in_pin(pin).remotes).ok()?;
+    let resource_rate = resource_rate_excl_process(chart, r.node, pin.node);
+    Some(resource_rate / (speed * qty))
+}
+
+fn fit_activity_to_output(chart: &Snarl<NodeMeta>, pin: OutPinId) -> Option<f64> {
+    let NodeMeta::Process(meta) = &chart[pin.node] else { unreachable!() };
+    let speed = eval_str(&meta.speed).ok()?;
+    let qty = eval_str(&meta.produces[pin.output]).ok()?;
+    let [r] = <[InPinId; 1]>::try_from(chart.out_pin(pin).remotes).ok()?;
+    let resource_rate = resource_rate_excl_process(chart, r.node, pin.node);
+    Some(-resource_rate / (speed * qty))
+}
+
 /// Return whether to retain.
 type ModalBox = Box<dyn FnMut(&mut App, &mut Ui) -> bool>;
 
@@ -98,6 +138,8 @@ enum DeferredAction {
     AddProduce(NodeId),
     RemoveConsume(InPinId),
     RemoveProduce(OutPinId),
+    FitActivityToInput(InPinId),
+    FitActivityToOutput(OutPinId),
 }
 
 struct ChartViewer<'a> {
@@ -226,7 +268,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("✖").clicked().then(|| self.action = DeferredAction::RemoveConsume(pin.id));
-                    ui.small_button("➡");
+                    ui.small_button("➡").clicked().then(|| self.action = DeferredAction::FitActivityToInput(pin.id));
                 });
             });
         }
@@ -247,7 +289,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
                 TextEdit::singleline(&mut meta.produces[pin.id.output]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    ui.small_button("⬅");
+                    ui.small_button("⬅").clicked().then(|| self.action = DeferredAction::FitActivityToOutput(pin.id));
                     ui.small_button("✖").clicked().then(|| self.action = DeferredAction::RemoveProduce(pin.id));
                 });
             });
@@ -272,7 +314,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
     }
 
     fn has_node_menu(&mut self, _: &NodeMeta) -> bool { true }
-    fn show_node_menu(&mut self, node: NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
+    fn show_node_menu(&mut self, node: NodeId, _: &[InPin], _: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
         ui.button("Delete").clicked().then(|| chart.remove_node(node));
     }
 }
@@ -319,6 +361,18 @@ impl eframe::App for App {
                         let old = OutPinId { node: pin.node, output: i };
                         let new = OutPinId { node: pin.node, output: i - 1 };
                         self.chart.out_pin(old).remotes.into_iter().for_each(|far| _ = self.chart.connect(new, far));
+                    }
+                }
+                DeferredAction::FitActivityToInput(pin) => {
+                    if let Some(activity) = fit_activity_to_input(&self.chart, pin) {
+                        let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
+                        meta.activity = activity.to_string();
+                    }
+                }
+                DeferredAction::FitActivityToOutput(pin) => {
+                    if let Some(activity) = fit_activity_to_output(&self.chart, pin) {
+                        let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
+                        meta.activity = activity.to_string();
                     }
                 }
             }
