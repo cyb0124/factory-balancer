@@ -1,18 +1,25 @@
+#![feature(try_blocks)]
+
 mod format;
 
 use crate::format::format_float;
-use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Layout, Modal, Pos2, TextEdit, ThemePreference, Ui, Vec2, vec2};
+use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Layout, Modal, Pos2, TextEdit, ThemePreference, TopBottomPanel, Ui, Vec2, vec2};
 use eframe::{CreationContext, NativeOptions, run_native};
+use egui_file_dialog::{DialogState, FileDialog};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use meval::eval_str;
-use std::{cell::LazyCell, collections::HashMap, mem::take};
+use serde::{Deserialize, Serialize};
+use std::fs::{read_to_string, write};
+use std::{cell::LazyCell, collections::HashMap};
 
+#[derive(Serialize, Deserialize)]
 enum NodeMeta {
     Resource(/** label */ String),
     Process(ProcessMeta),
 }
 
+#[derive(Serialize, Deserialize)]
 struct ProcessMeta {
     label: String,
     activity: String,
@@ -130,7 +137,7 @@ fn fit_activity_to_output(chart: &Snarl<NodeMeta>, pin: OutPinId) -> Option<f64>
 }
 
 /// Return whether to retain.
-type ModalBox = Box<dyn FnMut(&mut App, &mut Ui) -> bool>;
+type ModalBox = Box<dyn FnMut(&mut App, &Context) -> bool>;
 
 enum DeferredAction {
     None,
@@ -142,25 +149,9 @@ enum DeferredAction {
     FitActivityToOutput(OutPinId),
 }
 
-struct ChartViewer<'a> {
-    modal: &'a mut Option<ModalBox>,
+struct ChartViewer {
     action: DeferredAction,
     stats: ChartStats,
-}
-
-fn make_input_text_modal(prompt: &'static str, submit: impl Fn(&mut App, String) + 'static) -> ModalBox {
-    let mut text = String::new();
-    Box::new(move |app, ui| {
-        let resp = ui.horizontal(|ui| {
-            ui.label(prompt);
-            ui.text_edit_singleline(&mut text)
-        });
-        if resp.inner.lost_focus() && ui.input(|x| x.key_pressed(Key::Enter)) {
-            submit(app, take(&mut text));
-            return false;
-        }
-        !ui.input(|x| x.key_pressed(Key::Escape))
-    })
 }
 
 fn prepare_small_button(ui: &mut Ui) {
@@ -169,7 +160,7 @@ fn prepare_small_button(ui: &mut Ui) {
     spacing.item_spacing = vec2(1., 0.);
 }
 
-impl SnarlViewer<NodeMeta> for ChartViewer<'_> {
+impl SnarlViewer<NodeMeta> for ChartViewer {
     fn connect(&mut self, from: &OutPin, to: &InPin, chart: &mut Snarl<NodeMeta>) {
         match (&chart[from.id.node], &chart[to.id.node]) {
             (NodeMeta::Resource(_), NodeMeta::Resource(_)) => return,
@@ -323,13 +314,56 @@ struct App {
     style: SnarlStyle,
     chart: Snarl<NodeMeta>,
     modal: Option<ModalBox>,
+    path: String,
+}
+
+impl App {
+    fn alert(&mut self, msg: String) {
+        self.modal = Some(Box::new(move |_, ctx| {
+            let resp = Modal::new("alert".into()).show(ctx, |ui| _ = ui.label(&msg));
+            !resp.should_close()
+        }));
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+        TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.path);
+                ui.button("Pick").clicked().then(|| {
+                    let mut dialog = FileDialog::new().add_file_filter_extensions("Plain Text", vec!["txt"]);
+                    dialog.save_file();
+                    self.modal = Some(Box::new(move |app, ctx| {
+                        dialog.update(ctx);
+                        if let Some(picked) = dialog.take_picked() {
+                            app.path = picked.to_string_lossy().into_owned();
+                        }
+                        matches!(dialog.state(), DialogState::Open)
+                    }));
+                });
+                ui.button("Load").clicked().then(|| {
+                    match try {
+                        let data = read_to_string(&self.path).map_err(|e| e.to_string())?;
+                        ron::from_str(&data).map_err(|e| e.to_string())?
+                    } {
+                        Ok(chart) => self.chart = chart,
+                        Err(e) => self.alert(e),
+                    }
+                });
+                ui.button("Save").clicked().then(|| {
+                    if let Err(e) = try {
+                        let data = ron::to_string(&self.chart).map_err(|e| e.to_string())?;
+                        write(&self.path, data).map_err(|e| e.to_string())?
+                    } {
+                        self.alert(e);
+                    }
+                });
+            });
+        });
         CentralPanel::default().show(ctx, |ui| {
             let stats = ChartStats::compute(&self.chart);
-            let mut viewer = ChartViewer { modal: &mut self.modal, action: DeferredAction::None, stats };
+            let mut viewer = ChartViewer { action: DeferredAction::None, stats };
             self.chart.show(&mut viewer, &self.style, (), ui);
             match viewer.action {
                 DeferredAction::None => (),
@@ -367,20 +401,22 @@ impl eframe::App for App {
                     if let Some(activity) = fit_activity_to_input(&self.chart, pin) {
                         let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                         meta.activity = activity.to_string();
+                    } else {
+                        self.alert("Failed to compute".to_owned());
                     }
                 }
                 DeferredAction::FitActivityToOutput(pin) => {
                     if let Some(activity) = fit_activity_to_output(&self.chart, pin) {
                         let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                         meta.activity = activity.to_string();
+                    } else {
+                        self.alert("Failed to compute".to_owned());
                     }
                 }
             }
         });
         if let Some(mut modal) = self.modal.take() {
-            Modal::new("modal".into()).show(ctx, |ui| {
-                modal(self, ui).then(|| self.modal = Some(modal));
-            });
+            modal(self, ctx).then(|| self.modal = Some(modal));
         }
     }
 }
@@ -394,7 +430,7 @@ fn make_app(cc: &CreationContext) -> App {
         pin_placement: Some(PinPlacement::Edge),
         ..<_>::default()
     };
-    App { style, chart: Snarl::new(), modal: None }
+    App { style, chart: Snarl::new(), modal: None, path: String::new() }
 }
 
 fn main() {
