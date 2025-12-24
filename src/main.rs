@@ -40,8 +40,15 @@ struct ChartStats {
 }
 
 enum NodeStats {
-    Resource(/** rate */ f64),
+    Resource(ResourceStats),
     Process(/** valid */ bool),
+}
+
+#[derive(Default, Clone, Copy)]
+struct ResourceStats {
+    inc: f64,
+    dec: f64,
+    net: f64,
 }
 
 impl ProcessMeta {
@@ -59,7 +66,6 @@ impl ChartStats {
         let mut this = Self { nodes: HashMap::new() };
         for (node, meta) in chart.node_ids() {
             let NodeMeta::Process(meta) = &meta else { continue };
-            let mut adjs = Vec::with_capacity(meta.consumes.len() + meta.produces.len());
             let mut valid = false;
             if let Some(rate) = meta.common_rate() {
                 valid = true;
@@ -72,7 +78,10 @@ impl ChartStats {
                         valid = false;
                         continue;
                     };
-                    adjs.push((adj.node, -rate * qty));
+                    let rate = rate * qty;
+                    let stats = this.resource_mut(adj.node);
+                    stats.dec += rate;
+                    stats.net -= rate;
                 }
                 for (output, qty) in meta.produces.iter().enumerate() {
                     let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else {
@@ -83,19 +92,26 @@ impl ChartStats {
                         valid = false;
                         continue;
                     };
-                    adjs.push((adj.node, rate * qty));
+                    let rate = rate * qty;
+                    let stats = this.resource_mut(adj.node);
+                    stats.inc += rate;
+                    stats.net += rate;
                 }
             }
             this.nodes.insert(node, NodeStats::Process(valid));
-            for (node, rate) in adjs {
-                let NodeStats::Resource(total) = this.nodes.entry(node).or_insert_with(|| NodeStats::Resource(0.)) else { unreachable!() };
-                *total += rate;
-            }
         }
         this
     }
 
-    fn resource_rate(&self, node: NodeId) -> f64 { if let Some(NodeStats::Resource(rate)) = self.nodes.get(&node) { *rate } else { 0. } }
+    fn resource_mut(&mut self, node: NodeId) -> &mut ResourceStats {
+        let stats = self.nodes.entry(node).or_insert_with(|| NodeStats::Resource(<_>::default()));
+        let NodeStats::Resource(stats) = stats else { unreachable!() };
+        stats
+    }
+
+    fn resource(&self, node: NodeId) -> ResourceStats {
+        if let Some(NodeStats::Resource(stats)) = self.nodes.get(&node) { *stats } else { <_>::default() }
+    }
 }
 
 fn resource_rate_excl_process(chart: &Snarl<NodeMeta>, r: NodeId, p: NodeId) -> f64 {
@@ -204,10 +220,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         let Some(stats) = self.stats.nodes.get(&node) else { return frame };
         match stats {
             NodeStats::Process(valid) => _ = (!valid).then(|| frame.fill = Color32::DARK_RED),
-            NodeStats::Resource(rate) => {
-                if *rate < -THRESHOLD {
+            NodeStats::Resource(stats) => {
+                if stats.net < -THRESHOLD {
                     frame.fill = Color32::from_rgb(160, 80, 0);
-                } else if *rate > THRESHOLD {
+                } else if stats.net > THRESHOLD {
                     frame.fill = Color32::DARK_GREEN;
                 }
             }
@@ -220,12 +236,11 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         match &mut chart[node] {
             NodeMeta::Resource(_) => {
                 ui.set_width(72.);
-                let rate = match self.stats.resource_rate(node) {
-                    0. => "0".to_owned(),
-                    x if x.abs() < THRESHOLD => "≈0".to_owned(),
-                    x => format_float(x),
-                };
-                ui.vertical_centered(|ui| ui.label(rate));
+                let stats = self.stats.resource(node);
+                let inc = format_float(stats.inc, THRESHOLD);
+                let dec = format_float(stats.dec, THRESHOLD);
+                let net = format_float(stats.net, THRESHOLD);
+                ui.vertical_centered(|ui| ui.label(format!("➕ {inc}\n➖ {dec}\nNet {net}")));
             }
             NodeMeta::Process(meta) => {
                 ui.set_width(100.);
