@@ -441,6 +441,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
         TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.button("Source").clicked().then(|| {
+                    if let Err(e) = window().unwrap().open_with_url_and_target("https://github.com/cyb0124/factory-balancer/", "_blank") {
+                        self.alert(format!("{e:?}"));
+                    }
+                });
+                ui.separator();
                 ui.label("Browser Storage:");
                 if self.storage.is_some() {
                     TextEdit::singleline(&mut self.storage_key).desired_width(120.).show(ui);
