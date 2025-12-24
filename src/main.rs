@@ -17,6 +17,7 @@ use web_sys::{Storage, window};
 
 const THRESHOLD: f64 = 1E-9;
 const MODAL_WIDTH: f32 = 800.;
+const STORAGE_PREFIX: &str = "factory-balancer/";
 
 #[derive(Serialize, Deserialize)]
 enum NodeMeta {
@@ -356,33 +357,39 @@ impl App {
                 }
             });
             match action {
-                Action::None => !resp.should_close(),
+                Action::None => (),
                 Action::Load(key) => {
                     app.storage_key.clone_from(key);
                     app.load_from_storage();
-                    false
+                    return false;
                 }
                 Action::Delete(i) => {
-                    let key = keys.remove(i);
+                    let key = format!("{STORAGE_PREFIX}{}", keys.remove(i));
                     if let Err(e) = app.storage.as_ref().unwrap().remove_item(&key) {
                         app.alert(format!("{e:?}"));
                     }
-                    false
                 }
             }
+            !resp.should_close()
         }));
     }
 
     fn load_from_storage(&mut self) {
         if let Err(e) = (|| -> Result<()> {
             let storage = self.storage.as_ref().unwrap();
-            if self.storage_key.trim().is_empty() {
+            if self.storage_key.is_empty() {
                 let len = storage.length().map_err(|e| anyhow!("{e:?}"))?;
-                let keys = Option::<Vec<_>>::from_iter((0..len).map(|i| storage.key(i).ok().flatten()));
-                let keys = keys.context("Failed to list storage keys")?;
+                let mut keys = Vec::new();
+                for i in 0..len {
+                    let key = storage.key(i).ok().flatten().context("Failed to list storage keys")?;
+                    let Some(key) = key.strip_prefix(STORAGE_PREFIX) else { continue };
+                    let false = key.is_empty() else { continue };
+                    keys.push(key.to_owned());
+                }
                 return Ok(self.show_storage_key_list(keys));
             }
-            let data = storage.get_item(&self.storage_key).ok().flatten().context("Item not found")?;
+            let key = format!("{STORAGE_PREFIX}{}", self.storage_key);
+            let data = storage.get_item(&key).ok().flatten().context("Item not found")?;
             Ok(self.chart = ron::from_str(&data)?)
         })() {
             self.alert(format!("{e:?}"));
@@ -391,9 +398,10 @@ impl App {
 
     fn save_to_storage(&mut self) {
         if let Err(e) = (|| -> Result<()> {
-            ensure!(!self.storage_key.trim().is_empty(), "Storage key shouldn't be blank");
+            ensure!(!self.storage_key.is_empty(), "Storage key shouldn't be empty");
             let data = ron::to_string(&self.chart)?;
-            self.storage.as_ref().unwrap().set_item(&self.storage_key, &data).map_err(|e| anyhow!("{e:?}"))
+            let key = format!("{STORAGE_PREFIX}{}", self.storage_key);
+            self.storage.as_ref().unwrap().set_item(&key, &data).map_err(|e| anyhow!("{e:?}"))
         })() {
             self.alert(format!("{e:?}"));
         }
