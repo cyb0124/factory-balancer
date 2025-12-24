@@ -50,7 +50,13 @@ fn approx_decimal(mut value: f64) -> (u64, i32) {
     ((value + 0.5) as u64, scale)
 }
 
-pub fn format_float(float: f64) -> String {
-    let (value, scale) = approx_decimal(float.abs());
-    format_decimal(value, scale, float < 0.)
+pub fn format_float(float: f64, threshold: f64) -> String {
+    match float {
+        0. => "0".to_owned(),
+        x if x.abs() < threshold => "≈0".to_owned(),
+        x => {
+            let (value, scale) = approx_decimal(x.abs());
+            format_decimal(value, scale, x < 0.)
+        }
+    }
 }
