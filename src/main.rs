@@ -1,20 +1,22 @@
-#![feature(try_blocks)]
-
 mod format;
 
 use crate::format::format_float;
+use anyhow::{Context as _, Result, anyhow, ensure};
 use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Pos2, Ui, Vec2, vec2};
 use eframe::egui::{KeyboardShortcut, Layout, Modifiers, TextEdit, ThemePreference, TopBottomPanel};
-use eframe::{CreationContext, NativeOptions, run_native};
-use egui_file_dialog::{DialogState, FileDialog};
+use eframe::{CreationContext, WebRunner};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use meval::eval_str;
 use serde::{Deserialize, Serialize};
-use std::fs::{read_to_string, write};
-use std::{cell::LazyCell, collections::HashMap};
+use std::cell::{Cell, LazyCell};
+use std::{collections::HashMap, rc::Rc};
+use wasm_bindgen::prelude::JsCast;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+use web_sys::{Storage, window};
 
 const THRESHOLD: f64 = 1E-9;
+const MODAL_WIDTH: f32 = 800.;
 
 #[derive(Serialize, Deserialize)]
 enum NodeMeta {
@@ -140,7 +142,7 @@ fn fit_activity_to_output(chart: &Snarl<NodeMeta>, pin: OutPinId) -> Option<f64>
 /// Return whether to retain.
 type ModalBox = Box<dyn FnMut(&mut App, &Context) -> bool>;
 
-enum DeferredAction {
+enum Action {
     None,
     AddConsume(NodeId),
     AddProduce(NodeId),
@@ -151,7 +153,7 @@ enum DeferredAction {
 }
 
 struct ChartViewer {
-    action: DeferredAction,
+    action: Action,
     stats: ChartStats,
 }
 
@@ -241,9 +243,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     });
                     ui.horizontal(|ui| {
                         prepare_small_button(ui);
-                        ui.small_button("➕").clicked().then(|| self.action = DeferredAction::AddConsume(node));
+                        ui.small_button("➕").clicked().then(|| self.action = Action::AddConsume(node));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.small_button("➕").clicked().then(|| self.action = DeferredAction::AddProduce(node));
+                            ui.small_button("➕").clicked().then(|| self.action = Action::AddProduce(node));
                         });
                     });
                 });
@@ -264,8 +266,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 TextEdit::singleline(&mut meta.consumes[pin.id.input]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    ui.small_button("✖").clicked().then(|| self.action = DeferredAction::RemoveConsume(pin.id));
-                    ui.small_button("➡").clicked().then(|| self.action = DeferredAction::FitActivityToInput(pin.id));
+                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveConsume(pin.id));
+                    ui.small_button("➡").clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
                 });
             });
         }
@@ -286,8 +288,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 TextEdit::singleline(&mut meta.produces[pin.id.output]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    ui.small_button("⬅").clicked().then(|| self.action = DeferredAction::FitActivityToOutput(pin.id));
-                    ui.small_button("✖").clicked().then(|| self.action = DeferredAction::RemoveProduce(pin.id));
+                    ui.small_button("⬅").clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
+                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveProduce(pin.id));
                 });
             });
         }
@@ -320,53 +322,110 @@ struct App {
     style: SnarlStyle,
     chart: Snarl<NodeMeta>,
     modal: Option<ModalBox>,
-    path: String,
+    storage: Option<Storage>,
+    storage_key: String,
 }
 
 impl App {
     fn alert(&mut self, msg: String) {
         self.modal = Some(Box::new(move |_, ctx| {
-            let resp = Modal::new("alert".into()).show(ctx, |ui| _ = ui.label(&msg));
+            let resp = Modal::new("alert".into()).show(ctx, |ui| {
+                ui.set_max_width(MODAL_WIDTH);
+                ui.label(&msg);
+            });
             !resp.should_close()
         }));
     }
 
-    fn do_load(&mut self) {
-        match try {
-            let data = read_to_string(&self.path).map_err(|e| e.to_string())?;
-            ron::from_str(&data).map_err(|e| e.to_string())?
-        } {
-            Ok(chart) => self.chart = chart,
-            Err(e) => self.alert(e),
-        }
-    }
-
-    fn do_save(&mut self) {
-        if let Err(e) = try {
-            let data = ron::to_string(&self.chart).map_err(|e| e.to_string())?;
-            write(&self.path, data).map_err(|e| e.to_string())?
-        } {
-            self.alert(e);
-        }
-    }
-
-    fn pick_file(&mut self, save: bool, then: impl Fn(&mut App) + 'static) {
-        let (name, ext) = ("Plain Text", "txt");
-        let mut dialog = FileDialog::new().add_file_filter_extensions(name, vec![ext]);
-        if save {
-            dialog = dialog.add_save_extension(name, ext).default_save_extension(name);
-            dialog.save_file();
-        } else {
-            dialog.pick_file();
-        }
+    fn show_storage_key_list(&mut self, mut keys: Vec<String>) {
         self.modal = Some(Box::new(move |app, ctx| {
-            dialog.update(ctx);
-            if let Some(picked) = dialog.take_picked() {
-                app.path = picked.to_string_lossy().into_owned();
-                then(app);
+            enum Action<'a> {
+                None,
+                Load(&'a String),
+                Delete(usize),
             }
-            matches!(dialog.state(), DialogState::Open)
+            let mut action = Action::None;
+            let resp = Modal::new("storage_key_list".into()).show(ctx, |ui| {
+                ui.set_max_width(MODAL_WIDTH);
+                let false = keys.is_empty() else { return drop(ui.label("(Empty)")) };
+                for (i, key) in keys.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.button("✖").clicked().then(|| action = Action::Delete(i));
+                        ui.button(key).clicked().then(|| action = Action::Load(key));
+                    });
+                }
+            });
+            match action {
+                Action::None => !resp.should_close(),
+                Action::Load(key) => {
+                    app.storage_key.clone_from(key);
+                    app.load_from_storage();
+                    false
+                }
+                Action::Delete(i) => {
+                    let key = keys.remove(i);
+                    if let Err(e) = app.storage.as_ref().unwrap().remove_item(&key) {
+                        app.alert(format!("{e:?}"));
+                    }
+                    false
+                }
+            }
         }));
+    }
+
+    fn load_from_storage(&mut self) {
+        if let Err(e) = (|| -> Result<()> {
+            let storage = self.storage.as_ref().unwrap();
+            if self.storage_key.trim().is_empty() {
+                let len = storage.length().map_err(|e| anyhow!("{e:?}"))?;
+                let keys = Option::<Vec<_>>::from_iter((0..len).map(|i| storage.key(i).ok().flatten()));
+                let keys = keys.context("Failed to list storage keys")?;
+                return Ok(self.show_storage_key_list(keys));
+            }
+            let data = storage.get_item(&self.storage_key).ok().flatten().context("Item not found")?;
+            Ok(self.chart = ron::from_str(&data)?)
+        })() {
+            self.alert(format!("{e:?}"));
+        }
+    }
+
+    fn save_to_storage(&mut self) {
+        if let Err(e) = (|| -> Result<()> {
+            ensure!(!self.storage_key.trim().is_empty(), "Storage key shouldn't be blank");
+            let data = ron::to_string(&self.chart)?;
+            self.storage.as_ref().unwrap().set_item(&self.storage_key, &data).map_err(|e| anyhow!("{e:?}"))
+        })() {
+            self.alert(format!("{e:?}"));
+        }
+    }
+
+    fn load_from_clipboard(&mut self, ctx: Context) {
+        let data = JsFuture::from(window().unwrap().navigator().clipboard().read_text());
+        let slot = Rc::new(Cell::new(None::<Result<String>>));
+        let weak = Rc::downgrade(&slot);
+        self.modal = Some(Box::new(move |app, ctx| {
+            let Some(data) = slot.take() else {
+                Modal::new("wait_for_clipboard".into()).show(ctx, |ui| ui.label("Waiting for clipboard"));
+                return true;
+            };
+            if let Err(e) = (|| -> Result<()> { Ok(app.chart = ron::from_str(&data?)?) })() {
+                app.alert(format!("{e:?}"));
+            }
+            false
+        }));
+        spawn_local(async move {
+            let data = data.await;
+            let Some(slot) = weak.upgrade() else { return };
+            slot.set(Some(data.map_err(|e| anyhow!("{e:?}")).map(|x| x.as_string().context("Not a string")).flatten()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn save_to_clipboard(&mut self) {
+        match ron::to_string(&self.chart) {
+            Ok(data) => drop(window().unwrap().navigator().clipboard().write_text(&data)),
+            Err(e) => self.alert(e.to_string()),
+        }
     }
 }
 
@@ -374,38 +433,36 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
         TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.path);
-                (ui.button("Load").clicked() || ui.input_mut(|x| x.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::R)))).then(|| {
-                    if self.path.is_empty() {
-                        self.pick_file(false, |app| app.do_load());
-                    } else {
-                        self.do_load();
-                    }
-                });
-                (ui.button("Save").clicked() || ui.input_mut(|x| x.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::S)))).then(|| {
-                    if self.path.is_empty() {
-                        self.pick_file(true, |app| app.do_save());
-                    } else {
-                        self.do_save();
-                    }
-                });
+                ui.label("Browser Storage:");
+                if self.storage.is_some() {
+                    TextEdit::singleline(&mut self.storage_key).desired_width(120.).show(ui);
+                    ui.button("Load").clicked().then(|| self.load_from_storage());
+                    (ui.button("Save").clicked() || ui.input_mut(|x| x.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::S))))
+                        .then(|| self.save_to_storage());
+                } else {
+                    ui.label("(not available)");
+                }
+                ui.separator();
+                ui.label("Clipboard:");
+                ui.button("Load").clicked().then(|| self.load_from_clipboard(ctx.clone()));
+                ui.button("Save").clicked().then(|| self.save_to_clipboard());
             });
         });
         CentralPanel::default().show(ctx, |ui| {
             let stats = ChartStats::compute(&self.chart);
-            let mut viewer = ChartViewer { action: DeferredAction::None, stats };
+            let mut viewer = ChartViewer { action: Action::None, stats };
             self.chart.show(&mut viewer, &self.style, (), ui);
             match viewer.action {
-                DeferredAction::None => (),
-                DeferredAction::AddConsume(node) => {
+                Action::None => (),
+                Action::AddConsume(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
                     meta.consumes.push("1".to_owned());
                 }
-                DeferredAction::AddProduce(node) => {
+                Action::AddProduce(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
                     meta.produces.push("1".to_owned());
                 }
-                DeferredAction::RemoveConsume(pin) => {
+                Action::RemoveConsume(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                     let old_len = meta.consumes.len();
                     meta.consumes.remove(pin.input);
@@ -416,7 +473,7 @@ impl eframe::App for App {
                         self.chart.in_pin(old).remotes.into_iter().for_each(|far| _ = self.chart.connect(far, new));
                     }
                 }
-                DeferredAction::RemoveProduce(pin) => {
+                Action::RemoveProduce(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                     let old_len = meta.produces.len();
                     meta.produces.remove(pin.output);
@@ -427,7 +484,7 @@ impl eframe::App for App {
                         self.chart.out_pin(old).remotes.into_iter().for_each(|far| _ = self.chart.connect(new, far));
                     }
                 }
-                DeferredAction::FitActivityToInput(pin) => {
+                Action::FitActivityToInput(pin) => {
                     if let Some(activity) = fit_activity_to_input(&self.chart, pin) {
                         let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                         meta.activity = activity.to_string();
@@ -435,7 +492,7 @@ impl eframe::App for App {
                         self.alert("Failed to compute".to_owned());
                     }
                 }
-                DeferredAction::FitActivityToOutput(pin) => {
+                Action::FitActivityToOutput(pin) => {
                     if let Some(activity) = fit_activity_to_output(&self.chart, pin) {
                         let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                         meta.activity = activity.to_string();
@@ -460,11 +517,10 @@ fn make_app(cc: &CreationContext) -> App {
         pin_placement: Some(PinPlacement::Edge),
         ..<_>::default()
     };
-    App { style, chart: Snarl::new(), modal: None, path: String::new() }
+    App { style, chart: Snarl::new(), modal: None, storage: window().unwrap().local_storage().ok().flatten(), storage_key: String::new() }
 }
 
 fn main() {
-    let mut opts = NativeOptions::default();
-    opts.viewport.icon = Some(<_>::default());
-    run_native("factory-balancer", opts, Box::new(|cc| Ok(Box::new(make_app(cc))))).unwrap();
+    let canvas = window().unwrap().document().unwrap().get_element_by_id("main").unwrap().unchecked_into();
+    spawn_local(async { WebRunner::new().start(canvas, <_>::default(), Box::new(|cc| Ok(Box::new(make_app(cc))))).await.unwrap() });
 }
