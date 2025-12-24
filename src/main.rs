@@ -466,5 +466,5 @@ fn make_app(cc: &CreationContext) -> App {
 fn main() {
     let mut opts = NativeOptions::default();
     opts.viewport.icon = Some(<_>::default());
-    run_native("factor", opts, Box::new(|cc| Ok(Box::new(make_app(cc))))).unwrap();
+    run_native("factory-balancer", opts, Box::new(|cc| Ok(Box::new(make_app(cc))))).unwrap();
 }
