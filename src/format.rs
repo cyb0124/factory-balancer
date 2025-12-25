@@ -47,6 +47,10 @@ fn approx_decimal(mut value: f64) -> (u64, i32) {
         value *= 10.;
         scale -= 1;
     }
+    while value > 1E12 && scale < 32 {
+        value /= 1E6;
+        scale += 6;
+    }
     ((value + 0.5) as u64, scale)
 }
 

@@ -17,6 +17,7 @@ use web_sys::{Storage, window};
 
 const THRESHOLD: f64 = 1E-9;
 const MODAL_WIDTH: f32 = 800.;
+const TOOLTIP_WIDTH: f32 = 160.;
 const STORAGE_PREFIX: &str = "factory-balancer/";
 const BROWN: Color32 = Color32::from_rgb(160, 80, 0);
 
@@ -331,7 +332,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 msg += &format_float(*rate, THRESHOLD);
             }
             if !msg.is_empty() {
-                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::LEFT).show(|ui| ui.label(msg));
+                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::LEFT).show(|ui| {
+                    ui.set_max_width(TOOLTIP_WIDTH);
+                    ui.label(msg);
+                });
             }
         }
         PinInfo::square()
@@ -372,7 +376,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 msg += &format_float(*rate, THRESHOLD);
             }
             if !msg.is_empty() {
-                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::RIGHT).show(|ui| ui.label(msg));
+                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::RIGHT).show(|ui| {
+                    ui.set_max_width(TOOLTIP_WIDTH);
+                    ui.label(msg);
+                });
             }
         }
         PinInfo::square()
