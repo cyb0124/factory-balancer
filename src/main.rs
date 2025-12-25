@@ -2,7 +2,7 @@ mod format;
 
 use crate::format::format_float;
 use anyhow::{Context as _, Result, anyhow, ensure};
-use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Pos2, Ui, Vec2, vec2};
+use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Popup, Pos2, RectAlign, Ui, Vec2, vec2};
 use eframe::egui::{KeyboardShortcut, Layout, Modifiers, TextEdit, ThemePreference, TopBottomPanel};
 use eframe::{CreationContext, WebRunner};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
@@ -190,8 +190,6 @@ enum Action {
     RemoveOutput(OutPinId),
     FitActivityToInput(InPinId),
     FitActivityToOutput(OutPinId),
-    InputDetails(InPin),
-    OutputDetails(OutPin),
 }
 
 struct ChartViewer {
@@ -313,11 +311,28 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("✖").clicked().then(|| self.action = Action::RemoveInput(pin.id));
-                    let arrow = ui.small_button("➡");
-                    arrow.clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
-                    arrow.secondary_clicked().then(|| self.action = Action::InputDetails(pin.clone()));
+                    ui.small_button("➡").clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
                 });
             });
+        }
+        if let Some(NodeStats::Process(stats)) = self.stats.nodes.get(&pin.id.node)
+            && let Some(pos) = ui.input(|x| x.pointer.hover_pos())
+            && let rect = ui.min_rect().intersect(ui.clip_rect())
+            && let rect = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(rect, |t| t * rect)
+            && rect.contains(pos)
+        {
+            let mut msg = String::new();
+            if pin.remotes.len() == 1 {
+                let NodeMeta::Resource(label) = &chart[pin.remotes[0].node] else { unreachable!() };
+                msg.clone_from(label);
+            }
+            if let Some(rate) = stats.input_rates.get(pin.id.input) {
+                (!msg.is_empty()).then(|| msg += ": ");
+                msg += &format_float(*rate, THRESHOLD);
+            }
+            if !msg.is_empty() {
+                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::LEFT).show(|ui| ui.label(msg));
+            }
         }
         PinInfo::square()
     }
@@ -336,12 +351,29 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 TextEdit::singleline(&mut meta.produces[pin.id.output]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    let arrow = ui.small_button("⬅");
-                    arrow.clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
-                    arrow.secondary_clicked().then(|| self.action = Action::OutputDetails(pin.clone()));
+                    ui.small_button("⬅").clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
                     ui.small_button("✖").clicked().then(|| self.action = Action::RemoveOutput(pin.id));
                 });
             });
+        }
+        if let Some(NodeStats::Process(stats)) = self.stats.nodes.get(&pin.id.node)
+            && let Some(pos) = ui.input(|x| x.pointer.hover_pos())
+            && let rect = ui.min_rect().intersect(ui.clip_rect())
+            && let rect = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(rect, |t| t * rect)
+            && rect.contains(pos)
+        {
+            let mut msg = String::new();
+            if pin.remotes.len() == 1 {
+                let NodeMeta::Resource(label) = &chart[pin.remotes[0].node] else { unreachable!() };
+                msg.clone_from(label);
+            }
+            if let Some(rate) = stats.output_rates.get(pin.id.output) {
+                (!msg.is_empty()).then(|| msg += ": ");
+                msg += &format_float(*rate, THRESHOLD);
+            }
+            if !msg.is_empty() {
+                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::RIGHT).show(|ui| ui.label(msg));
+            }
         }
         PinInfo::square()
     }
@@ -562,32 +594,6 @@ impl eframe::App for App {
                     } else {
                         self.alert("Failed to compute".to_owned());
                     }
-                }
-                Action::InputDetails(pin) => {
-                    let Some(NodeStats::Process(stats)) = viewer.stats.nodes.get(&pin.id.node) else { return };
-                    let mut msg = String::new();
-                    if pin.remotes.len() == 1 {
-                        let NodeMeta::Resource(label) = &self.chart[pin.remotes[0].node] else { unreachable!() };
-                        msg.clone_from(label);
-                    }
-                    if let Some(rate) = stats.input_rates.get(pin.id.input) {
-                        (!msg.is_empty()).then(|| msg += ": ");
-                        msg += &format_float(*rate, THRESHOLD);
-                    }
-                    (!msg.is_empty()).then(|| self.alert(msg));
-                }
-                Action::OutputDetails(pin) => {
-                    let Some(NodeStats::Process(stats)) = viewer.stats.nodes.get(&pin.id.node) else { return };
-                    let mut msg = String::new();
-                    if pin.remotes.len() == 1 {
-                        let NodeMeta::Resource(label) = &self.chart[pin.remotes[0].node] else { unreachable!() };
-                        msg.clone_from(label);
-                    }
-                    if let Some(rate) = stats.output_rates.get(pin.id.output) {
-                        (!msg.is_empty()).then(|| msg += ": ");
-                        msg += &format_float(*rate, THRESHOLD);
-                    }
-                    (!msg.is_empty()).then(|| self.alert(msg));
                 }
             }
         });
