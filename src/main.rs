@@ -18,6 +18,7 @@ use web_sys::{Storage, window};
 const THRESHOLD: f64 = 1E-9;
 const MODAL_WIDTH: f32 = 800.;
 const STORAGE_PREFIX: &str = "factory-balancer/";
+const BROWN: Color32 = Color32::from_rgb(160, 80, 0);
 
 #[derive(Serialize, Deserialize)]
 enum NodeMeta {
@@ -41,7 +42,7 @@ struct ChartStats {
 
 enum NodeStats {
     Resource(ResourceStats),
-    Process(/** valid */ bool),
+    Process(ProcessStats),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -51,13 +52,34 @@ struct ResourceStats {
     net: f64,
 }
 
+struct ProcessStats {
+    status: ProcessStatus,
+    input_rates: Box<[f64]>,
+    output_rates: Box<[f64]>,
+}
+
+enum ProcessStatus {
+    Invalid,
+    Balanced,
+    Deficient,
+    Excess,
+}
+
 impl ProcessMeta {
-    fn common_rate(&self) -> Option<f64> {
+    fn common_rate(&self) -> Option<(f64, ProcessStatus)> {
         let mut rate = eval_str(&self.capacity).ok()?;
+        let mut status = ProcessStatus::Balanced;
         if !self.activity.is_empty() {
-            rate = rate.min(eval_str(&self.activity).ok()?);
+            let activity = eval_str(&self.activity).ok()?;
+            let excess = rate - activity;
+            if excess < -THRESHOLD {
+                status = ProcessStatus::Deficient;
+            } else if excess > 1. - THRESHOLD {
+                status = ProcessStatus::Excess;
+            }
+            rate = rate.min(activity);
         }
-        Some(rate * eval_str(&self.speed).ok()?)
+        Some((rate * eval_str(&self.speed).ok()?, status))
     }
 }
 
@@ -66,39 +88,40 @@ impl ChartStats {
         let mut this = Self { nodes: HashMap::new() };
         for (node, meta) in chart.node_ids() {
             let NodeMeta::Process(meta) = &meta else { continue };
-            let mut valid = false;
-            if let Some(rate) = meta.common_rate() {
-                valid = true;
-                for (input, qty) in meta.consumes.iter().enumerate() {
+            let stats = if let Some((rate, mut status)) = meta.common_rate() {
+                let input_rates = Box::from_iter(meta.consumes.iter().enumerate().map(|(input, qty)| {
+                    let Ok(qty) = eval_str(qty) else {
+                        status = ProcessStatus::Invalid;
+                        return 0.;
+                    };
+                    let rate = rate * qty;
                     let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else {
-                        valid = false;
-                        continue;
+                        status = ProcessStatus::Invalid;
+                        return rate;
                     };
+                    let stats = this.resource_mut(adj.node);
+                    (stats.dec += rate, stats.net -= rate);
+                    rate
+                }));
+                let output_rates = Box::from_iter(meta.produces.iter().enumerate().map(|(output, qty)| {
                     let Ok(qty) = eval_str(qty) else {
-                        valid = false;
-                        continue;
+                        status = ProcessStatus::Invalid;
+                        return 0.;
                     };
                     let rate = rate * qty;
-                    let stats = this.resource_mut(adj.node);
-                    stats.dec += rate;
-                    stats.net -= rate;
-                }
-                for (output, qty) in meta.produces.iter().enumerate() {
                     let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else {
-                        valid = false;
-                        continue;
+                        status = ProcessStatus::Invalid;
+                        return rate;
                     };
-                    let Ok(qty) = eval_str(qty) else {
-                        valid = false;
-                        continue;
-                    };
-                    let rate = rate * qty;
                     let stats = this.resource_mut(adj.node);
-                    stats.inc += rate;
-                    stats.net += rate;
-                }
-            }
-            this.nodes.insert(node, NodeStats::Process(valid));
+                    (stats.inc += rate, stats.net += rate);
+                    rate
+                }));
+                ProcessStats { status, input_rates, output_rates }
+            } else {
+                ProcessStats { status: ProcessStatus::Invalid, input_rates: <_>::default(), output_rates: <_>::default() }
+            };
+            this.nodes.insert(node, NodeStats::Process(stats));
         }
         this
     }
@@ -119,7 +142,7 @@ fn resource_rate_excl_process(chart: &Snarl<NodeMeta>, r: NodeId, p: NodeId) -> 
     'outer: for (node, meta) in chart.node_ids() {
         let false = node == p else { continue };
         let NodeMeta::Process(meta) = &meta else { continue };
-        let rate = LazyCell::new(|| meta.common_rate());
+        let rate = LazyCell::new(|| meta.common_rate().map(|x| x.0));
         for (input, qty) in meta.consumes.iter().enumerate() {
             let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else { continue };
             let true = adj.node == r else { continue };
@@ -161,12 +184,14 @@ type ModalBox = Box<dyn FnMut(&mut App, &Context) -> bool>;
 
 enum Action {
     None,
-    AddConsume(NodeId),
-    AddProduce(NodeId),
-    RemoveConsume(InPinId),
-    RemoveProduce(OutPinId),
+    AddInput(NodeId),
+    AddOutput(NodeId),
+    RemoveInput(InPinId),
+    RemoveOutput(OutPinId),
     FitActivityToInput(InPinId),
     FitActivityToOutput(OutPinId),
+    InputDetails(InPin),
+    OutputDetails(OutPin),
 }
 
 struct ChartViewer {
@@ -219,10 +244,15 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn node_frame(&mut self, mut frame: Frame, node: NodeId, _: &[InPin], _: &[OutPin], _: &Snarl<NodeMeta>) -> Frame {
         let Some(stats) = self.stats.nodes.get(&node) else { return frame };
         match stats {
-            NodeStats::Process(valid) => _ = (!valid).then(|| frame.fill = Color32::DARK_RED),
+            NodeStats::Process(stats) => match stats.status {
+                ProcessStatus::Invalid => frame.fill = Color32::DARK_RED,
+                ProcessStatus::Balanced => (),
+                ProcessStatus::Deficient => frame.fill = BROWN,
+                ProcessStatus::Excess => frame.fill = Color32::DARK_GREEN,
+            },
             NodeStats::Resource(stats) => {
                 if stats.net < -THRESHOLD {
-                    frame.fill = Color32::from_rgb(160, 80, 0);
+                    frame.fill = BROWN;
                 } else if stats.net > THRESHOLD {
                     frame.fill = Color32::DARK_GREEN;
                 }
@@ -259,9 +289,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     });
                     ui.horizontal(|ui| {
                         prepare_small_button(ui);
-                        ui.small_button("➕").clicked().then(|| self.action = Action::AddConsume(node));
+                        ui.small_button("➕").clicked().then(|| self.action = Action::AddInput(node));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.small_button("➕").clicked().then(|| self.action = Action::AddProduce(node));
+                            ui.small_button("➕").clicked().then(|| self.action = Action::AddOutput(node));
                         });
                     });
                 });
@@ -282,8 +312,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 TextEdit::singleline(&mut meta.consumes[pin.id.input]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveConsume(pin.id));
-                    ui.small_button("➡").clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
+                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveInput(pin.id));
+                    let arrow = ui.small_button("➡");
+                    arrow.clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
+                    arrow.secondary_clicked().then(|| self.action = Action::InputDetails(pin.clone()));
                 });
             });
         }
@@ -304,8 +336,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 TextEdit::singleline(&mut meta.produces[pin.id.output]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
-                    ui.small_button("⬅").clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
-                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveProduce(pin.id));
+                    let arrow = ui.small_button("⬅");
+                    arrow.clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
+                    arrow.secondary_clicked().then(|| self.action = Action::OutputDetails(pin.clone()));
+                    ui.small_button("✖").clicked().then(|| self.action = Action::RemoveOutput(pin.id));
                 });
             });
         }
@@ -483,15 +517,15 @@ impl eframe::App for App {
             self.chart.show(&mut viewer, &self.style, (), ui);
             match viewer.action {
                 Action::None => (),
-                Action::AddConsume(node) => {
+                Action::AddInput(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
                     meta.consumes.push("1".to_owned());
                 }
-                Action::AddProduce(node) => {
+                Action::AddOutput(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
                     meta.produces.push("1".to_owned());
                 }
-                Action::RemoveConsume(pin) => {
+                Action::RemoveInput(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                     let old_len = meta.consumes.len();
                     meta.consumes.remove(pin.input);
@@ -502,7 +536,7 @@ impl eframe::App for App {
                         self.chart.in_pin(old).remotes.into_iter().for_each(|far| _ = self.chart.connect(far, new));
                     }
                 }
-                Action::RemoveProduce(pin) => {
+                Action::RemoveOutput(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
                     let old_len = meta.produces.len();
                     meta.produces.remove(pin.output);
@@ -528,6 +562,32 @@ impl eframe::App for App {
                     } else {
                         self.alert("Failed to compute".to_owned());
                     }
+                }
+                Action::InputDetails(pin) => {
+                    let Some(NodeStats::Process(stats)) = viewer.stats.nodes.get(&pin.id.node) else { return };
+                    let mut msg = String::new();
+                    if pin.remotes.len() == 1 {
+                        let NodeMeta::Resource(label) = &self.chart[pin.remotes[0].node] else { unreachable!() };
+                        msg.clone_from(label);
+                    }
+                    if let Some(rate) = stats.input_rates.get(pin.id.input) {
+                        (!msg.is_empty()).then(|| msg += ": ");
+                        msg += &format_float(*rate, THRESHOLD);
+                    }
+                    (!msg.is_empty()).then(|| self.alert(msg));
+                }
+                Action::OutputDetails(pin) => {
+                    let Some(NodeStats::Process(stats)) = viewer.stats.nodes.get(&pin.id.node) else { return };
+                    let mut msg = String::new();
+                    if pin.remotes.len() == 1 {
+                        let NodeMeta::Resource(label) = &self.chart[pin.remotes[0].node] else { unreachable!() };
+                        msg.clone_from(label);
+                    }
+                    if let Some(rate) = stats.output_rates.get(pin.id.output) {
+                        (!msg.is_empty()).then(|| msg += ": ");
+                        msg += &format_float(*rate, THRESHOLD);
+                    }
+                    (!msg.is_empty()).then(|| self.alert(msg));
                 }
             }
         });
