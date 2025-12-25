@@ -72,7 +72,7 @@ impl ProcessMeta {
         if !self.activity.is_empty() {
             let activity = eval_str(&self.activity).ok()?;
             let excess = rate - activity;
-            if excess < -THRESHOLD {
+            if excess < -2. * THRESHOLD {
                 status = ProcessStatus::Deficient;
             } else if excess > 1. - THRESHOLD {
                 status = ProcessStatus::Excess;
