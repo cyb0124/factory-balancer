@@ -2,7 +2,7 @@ mod format;
 
 use crate::format::format_float;
 use anyhow::{Context as _, Result, anyhow, ensure};
-use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Popup, Pos2, RectAlign, Ui, Vec2, vec2};
+use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Popup, Pos2, RectAlign, TextWrapMode, Ui, Vec2, vec2};
 use eframe::egui::{KeyboardShortcut, Layout, Modifiers, TextEdit, ThemePreference, TopBottomPanel};
 use eframe::{CreationContext, WebRunner};
 use egui_snarl::ui::{PinInfo, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer};
@@ -10,7 +10,7 @@ use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use meval::eval_str;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, LazyCell};
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, ops::Not, rc::Rc};
 use wasm_bindgen::prelude::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Storage, window};
@@ -23,18 +23,28 @@ const BROWN: Color32 = Color32::from_rgb(160, 80, 0);
 
 #[derive(Serialize, Deserialize, Clone)]
 enum NodeMeta {
-    Resource(/** label */ String),
+    Resource(ResourceMeta),
     Process(ProcessMeta),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ResourceMeta {
+    label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    base_rate: String,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    use_base_rate: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ProcessMeta {
     label: String,
     capacity: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     activity: String,
     speed: String,
-    consumes: Vec<String>,
-    produces: Vec<String>,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
 }
 
 struct ChartStats {
@@ -48,6 +58,7 @@ enum NodeStats {
 
 #[derive(Default, Clone, Copy)]
 struct ResourceStats {
+    invalid: bool,
     inc: f64,
     dec: f64,
     net: f64,
@@ -88,41 +99,44 @@ impl ChartStats {
     fn compute(chart: &Snarl<NodeMeta>) -> Self {
         let mut this = Self { nodes: HashMap::new() };
         for (node, meta) in chart.node_ids() {
-            let NodeMeta::Process(meta) = &meta else { continue };
-            let stats = if let Some((rate, mut status)) = meta.common_rate() {
-                let input_rates = Box::from_iter(meta.consumes.iter().enumerate().map(|(input, qty)| {
-                    let Ok(qty) = eval_str(qty) else {
-                        status = ProcessStatus::Invalid;
-                        return 0.;
+            match meta {
+                NodeMeta::Resource(meta) => {
+                    if meta.use_base_rate {
+                        let stats = this.resource_mut(node);
+                        if let Ok(base_rate) = eval_str(&meta.base_rate) {
+                            stats.net += base_rate;
+                        } else {
+                            stats.invalid = true;
+                        }
+                    }
+                }
+                NodeMeta::Process(meta) => {
+                    let stats = if let Some((rate, mut status)) = meta.common_rate() {
+                        let input_rates = Box::from_iter(meta.inputs.iter().enumerate().map(|(input, qty)| {
+                            let Ok(qty) = eval_str(qty) else { return (0., status = ProcessStatus::Invalid).0 };
+                            let rate = rate * qty;
+                            let adj = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes);
+                            let Ok([adj]) = adj else { return (0., status = ProcessStatus::Invalid).0 };
+                            let stats = this.resource_mut(adj.node);
+                            (stats.dec += rate, stats.net -= rate);
+                            rate
+                        }));
+                        let output_rates = Box::from_iter(meta.outputs.iter().enumerate().map(|(output, qty)| {
+                            let Ok(qty) = eval_str(qty) else { return (0., status = ProcessStatus::Invalid).0 };
+                            let rate = rate * qty;
+                            let adj = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes);
+                            let Ok([adj]) = adj else { return (0., status = ProcessStatus::Invalid).0 };
+                            let stats = this.resource_mut(adj.node);
+                            (stats.inc += rate, stats.net += rate);
+                            rate
+                        }));
+                        ProcessStats { status, input_rates, output_rates }
+                    } else {
+                        ProcessStats { status: ProcessStatus::Invalid, input_rates: <_>::default(), output_rates: <_>::default() }
                     };
-                    let rate = rate * qty;
-                    let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else {
-                        status = ProcessStatus::Invalid;
-                        return rate;
-                    };
-                    let stats = this.resource_mut(adj.node);
-                    (stats.dec += rate, stats.net -= rate);
-                    rate
-                }));
-                let output_rates = Box::from_iter(meta.produces.iter().enumerate().map(|(output, qty)| {
-                    let Ok(qty) = eval_str(qty) else {
-                        status = ProcessStatus::Invalid;
-                        return 0.;
-                    };
-                    let rate = rate * qty;
-                    let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else {
-                        status = ProcessStatus::Invalid;
-                        return rate;
-                    };
-                    let stats = this.resource_mut(adj.node);
-                    (stats.inc += rate, stats.net += rate);
-                    rate
-                }));
-                ProcessStats { status, input_rates, output_rates }
-            } else {
-                ProcessStats { status: ProcessStatus::Invalid, input_rates: <_>::default(), output_rates: <_>::default() }
-            };
-            this.nodes.insert(node, NodeStats::Process(stats));
+                    this.nodes.insert(node, NodeStats::Process(stats));
+                }
+            }
         }
         this
     }
@@ -139,19 +153,20 @@ impl ChartStats {
 }
 
 fn resource_rate_excl_process(chart: &Snarl<NodeMeta>, r: NodeId, p: NodeId) -> f64 {
-    let mut result = 0.;
+    let NodeMeta::Resource(meta) = &chart[r] else { unreachable!() };
+    let mut result = meta.use_base_rate.then(|| eval_str(&meta.base_rate).ok()).flatten().unwrap_or(0.);
     'outer: for (node, meta) in chart.node_ids() {
         let false = node == p else { continue };
         let NodeMeta::Process(meta) = &meta else { continue };
         let rate = LazyCell::new(|| meta.common_rate().map(|x| x.0));
-        for (input, qty) in meta.consumes.iter().enumerate() {
+        for (input, qty) in meta.inputs.iter().enumerate() {
             let Ok([adj]) = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes) else { continue };
             let true = adj.node == r else { continue };
             let Ok(qty) = eval_str(qty) else { continue };
             let Some(rate) = *rate else { continue 'outer };
             result -= rate * qty;
         }
-        for (output, qty) in meta.produces.iter().enumerate() {
+        for (output, qty) in meta.outputs.iter().enumerate() {
             let Ok([adj]) = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes) else { continue };
             let true = adj.node == r else { continue };
             let Ok(qty) = eval_str(qty) else { continue };
@@ -165,7 +180,7 @@ fn resource_rate_excl_process(chart: &Snarl<NodeMeta>, r: NodeId, p: NodeId) -> 
 fn fit_activity_to_input(chart: &Snarl<NodeMeta>, pin: InPinId) -> Option<f64> {
     let NodeMeta::Process(meta) = &chart[pin.node] else { unreachable!() };
     let speed = eval_str(&meta.speed).ok()?;
-    let qty = eval_str(&meta.consumes[pin.input]).ok()?;
+    let qty = eval_str(&meta.inputs[pin.input]).ok()?;
     let [r] = <[OutPinId; 1]>::try_from(chart.in_pin(pin).remotes).ok()?;
     let resource_rate = resource_rate_excl_process(chart, r.node, pin.node);
     Some(resource_rate / (speed * qty))
@@ -174,7 +189,7 @@ fn fit_activity_to_input(chart: &Snarl<NodeMeta>, pin: InPinId) -> Option<f64> {
 fn fit_activity_to_output(chart: &Snarl<NodeMeta>, pin: OutPinId) -> Option<f64> {
     let NodeMeta::Process(meta) = &chart[pin.node] else { unreachable!() };
     let speed = eval_str(&meta.speed).ok()?;
-    let qty = eval_str(&meta.produces[pin.output]).ok()?;
+    let qty = eval_str(&meta.outputs[pin.output]).ok()?;
     let [r] = <[InPinId; 1]>::try_from(chart.out_pin(pin).remotes).ok()?;
     let resource_rate = resource_rate_excl_process(chart, r.node, pin.node);
     Some(-resource_rate / (speed * qty))
@@ -191,7 +206,8 @@ enum Action {
     RemoveOutput(OutPinId),
     FitActivityToInput(InPinId),
     FitActivityToOutput(OutPinId),
-    Duplicate(NodeId, Pos2),
+    Duplicate(NodeId),
+    Delete(NodeId),
 }
 
 struct ChartViewer {
@@ -222,18 +238,18 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
 
     fn title(&mut self, meta: &NodeMeta) -> String {
         match meta {
-            NodeMeta::Resource(label) => label.clone(),
+            NodeMeta::Resource(meta) => meta.label.clone(),
             NodeMeta::Process(meta) => meta.label.clone(),
         }
     }
 
     fn show_header(&mut self, node: NodeId, _: &[InPin], _: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
         let (width, label) = match &mut chart[node] {
-            NodeMeta::Resource(label) => (80., label),
+            NodeMeta::Resource(meta) => (80., &mut meta.label),
             NodeMeta::Process(meta) => {
                 let mut width = 108.;
-                (!meta.consumes.is_empty()).then(|| width += 36.);
-                (!meta.produces.is_empty()).then(|| width += 36.);
+                (!meta.inputs.is_empty()).then(|| width += 36.);
+                (!meta.outputs.is_empty()).then(|| width += 36.);
                 (width, &mut meta.label)
             }
         };
@@ -251,7 +267,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 ProcessStatus::Excess => frame.fill = Color32::DARK_GREEN,
             },
             NodeStats::Resource(stats) => {
-                if stats.net < -THRESHOLD {
+                if stats.invalid {
+                    frame.fill = Color32::DARK_RED;
+                } else if stats.net < -THRESHOLD {
                     frame.fill = BROWN;
                 } else if stats.net > THRESHOLD {
                     frame.fill = Color32::DARK_GREEN;
@@ -264,13 +282,16 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn has_body(&mut self, _: &NodeMeta) -> bool { true }
     fn show_body(&mut self, node: NodeId, _: &[InPin], _: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
         match &mut chart[node] {
-            NodeMeta::Resource(_) => {
+            NodeMeta::Resource(meta) => {
                 ui.set_width(72.);
-                let stats = self.stats.resource(node);
-                let inc = format_float(stats.inc, THRESHOLD);
-                let dec = format_float(stats.dec, THRESHOLD);
-                let net = format_float(stats.net, THRESHOLD);
-                ui.vertical_centered(|ui| ui.label(format!("➕ {inc}\n➖ {dec}\nNet {net}")));
+                ui.vertical_centered(|ui| {
+                    meta.use_base_rate.then(|| TextEdit::singleline(&mut meta.base_rate).desired_width(f32::INFINITY).show(ui));
+                    let stats = self.stats.resource(node);
+                    let inc = format_float(stats.inc, THRESHOLD);
+                    let dec = format_float(stats.dec, THRESHOLD);
+                    let net = format_float(stats.net, THRESHOLD);
+                    ui.label(format!("➕ {inc}\n➖ {dec}\nNet {net}"));
+                });
             }
             NodeMeta::Process(meta) => {
                 ui.set_width(100.);
@@ -302,14 +323,14 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn inputs(&mut self, meta: &NodeMeta) -> usize {
         match meta {
             NodeMeta::Resource(_) => 1,
-            NodeMeta::Process(meta) => meta.consumes.len(),
+            NodeMeta::Process(meta) => meta.inputs.len(),
         }
     }
 
     fn show_input(&mut self, pin: &InPin, ui: &mut Ui, chart: &mut Snarl<NodeMeta>) -> impl SnarlPin + 'static {
         if let NodeMeta::Process(meta) = &mut chart[pin.id.node] {
             ui.vertical(|ui| {
-                TextEdit::singleline(&mut meta.consumes[pin.id.input]).desired_width(20.).show(ui);
+                TextEdit::singleline(&mut meta.inputs[pin.id.input]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("✖").clicked().then(|| self.action = Action::RemoveInput(pin.id));
@@ -325,8 +346,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         {
             let mut msg = String::new();
             if pin.remotes.len() == 1 {
-                let NodeMeta::Resource(label) = &chart[pin.remotes[0].node] else { unreachable!() };
-                msg.clone_from(label);
+                let NodeMeta::Resource(meta) = &chart[pin.remotes[0].node] else { unreachable!() };
+                msg.clone_from(&meta.label);
             }
             if let Some(rate) = stats.input_rates.get(pin.id.input) {
                 (!msg.is_empty()).then(|| msg += ": ");
@@ -345,7 +366,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn outputs(&mut self, meta: &NodeMeta) -> usize {
         match meta {
             NodeMeta::Resource(_) => 1,
-            NodeMeta::Process(meta) => meta.produces.len(),
+            NodeMeta::Process(meta) => meta.outputs.len(),
         }
     }
 
@@ -353,7 +374,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         if let NodeMeta::Process(meta) = &mut chart[pin.id.node] {
             ui.set_width(30.);
             ui.vertical(|ui| {
-                TextEdit::singleline(&mut meta.produces[pin.id.output]).desired_width(20.).show(ui);
+                TextEdit::singleline(&mut meta.outputs[pin.id.output]).desired_width(20.).show(ui);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("⬅").clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
@@ -369,8 +390,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         {
             let mut msg = String::new();
             if pin.remotes.len() == 1 {
-                let NodeMeta::Resource(label) = &chart[pin.remotes[0].node] else { unreachable!() };
-                msg.clone_from(label);
+                let NodeMeta::Resource(meta) = &chart[pin.remotes[0].node] else { unreachable!() };
+                msg.clone_from(&meta.label);
             }
             if let Some(rate) = stats.output_rates.get(pin.id.output) {
                 (!msg.is_empty()).then(|| msg += ": ");
@@ -388,15 +409,17 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
 
     fn has_graph_menu(&mut self, _: Pos2, _: &mut Snarl<NodeMeta>) -> bool { true }
     fn show_graph_menu(&mut self, pos: Pos2, ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
-        ui.button("New Resource").clicked().then(|| _ = chart.insert_node(pos, NodeMeta::Resource(String::new())));
+        ui.button("New Resource").clicked().then(|| {
+            chart.insert_node(pos, NodeMeta::Resource(ResourceMeta { label: String::new(), base_rate: String::new(), use_base_rate: false }));
+        });
         ui.button("New Process").clicked().then(|| {
             let meta = ProcessMeta {
                 label: String::new(),
                 capacity: "1".to_owned(),
                 activity: String::new(),
                 speed: "1".to_owned(),
-                consumes: vec!["1".to_owned()],
-                produces: vec!["1".to_owned()],
+                inputs: vec!["1".to_owned()],
+                outputs: vec!["1".to_owned()],
             };
             chart.insert_node(pos, NodeMeta::Process(meta));
         });
@@ -404,10 +427,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
 
     fn has_node_menu(&mut self, _: &NodeMeta) -> bool { true }
     fn show_node_menu(&mut self, node: NodeId, _: &[InPin], _: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
-        ui.button("Delete").clicked().then(|| chart.remove_node(node));
-        let resp = ui.button("Duplicate");
-        if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten() {
-            self.action = Action::Duplicate(node, pos);
+        ui.button("Delete").clicked().then(|| self.action = Action::Delete(node));
+        ui.button("Duplicate").clicked().then(|| self.action = Action::Duplicate(node));
+        if let NodeMeta::Resource(meta) = &mut chart[node] {
+            ui.checkbox(&mut meta.use_base_rate, "Enable Base Rate");
         }
     }
 }
@@ -563,16 +586,16 @@ impl eframe::App for App {
                 Action::None => (),
                 Action::AddInput(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
-                    meta.consumes.push("1".to_owned());
+                    meta.inputs.push("1".to_owned());
                 }
                 Action::AddOutput(node) => {
                     let NodeMeta::Process(meta) = &mut self.chart[node] else { unreachable!() };
-                    meta.produces.push("1".to_owned());
+                    meta.outputs.push("1".to_owned());
                 }
                 Action::RemoveInput(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
-                    let old_len = meta.consumes.len();
-                    meta.consumes.remove(pin.input);
+                    let old_len = meta.inputs.len();
+                    meta.inputs.remove(pin.input);
                     self.chart.drop_inputs(pin);
                     for i in pin.input + 1..old_len {
                         let old = InPinId { node: pin.node, input: i };
@@ -582,8 +605,8 @@ impl eframe::App for App {
                 }
                 Action::RemoveOutput(pin) => {
                     let NodeMeta::Process(meta) = &mut self.chart[pin.node] else { unreachable!() };
-                    let old_len = meta.produces.len();
-                    meta.produces.remove(pin.output);
+                    let old_len = meta.outputs.len();
+                    meta.outputs.remove(pin.output);
                     self.chart.drop_outputs(pin);
                     for i in pin.output + 1..old_len {
                         let old = OutPinId { node: pin.node, output: i };
@@ -607,9 +630,11 @@ impl eframe::App for App {
                         self.alert("Failed to compute".to_owned());
                     }
                 }
-                Action::Duplicate(node, pos) => {
-                    self.chart.insert_node(pos, self.chart[node].clone());
+                Action::Duplicate(node) => {
+                    let node = self.chart.get_node_info(node).unwrap();
+                    self.chart.insert_node(node.pos + vec2(32., 32.), node.value.clone());
                 }
+                Action::Delete(node) => drop(self.chart.remove_node(node)),
             }
         });
         if let Some(mut modal) = self.modal.take() {
@@ -620,6 +645,7 @@ impl eframe::App for App {
 
 fn make_app(cc: &CreationContext) -> App {
     cc.egui_ctx.set_theme(ThemePreference::Dark);
+    cc.egui_ctx.style_mut(|x| x.wrap_mode = Some(TextWrapMode::Extend));
     let style = SnarlStyle {
         header_drag_space: Some(Vec2::ZERO),
         collapsible: Some(false),
