@@ -21,13 +21,13 @@ const TOOLTIP_WIDTH: f32 = 160.;
 const STORAGE_PREFIX: &str = "factory-balancer/";
 const BROWN: Color32 = Color32::from_rgb(160, 80, 0);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum NodeMeta {
     Resource(/** label */ String),
     Process(ProcessMeta),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ProcessMeta {
     label: String,
     capacity: String,
@@ -191,6 +191,7 @@ enum Action {
     RemoveOutput(OutPinId),
     FitActivityToInput(InPinId),
     FitActivityToOutput(OutPinId),
+    Duplicate(NodeId, Pos2),
 }
 
 struct ChartViewer {
@@ -404,6 +405,10 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn has_node_menu(&mut self, _: &NodeMeta) -> bool { true }
     fn show_node_menu(&mut self, node: NodeId, _: &[InPin], _: &[OutPin], ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
         ui.button("Delete").clicked().then(|| chart.remove_node(node));
+        let resp = ui.button("Duplicate");
+        if let Some(pos) = resp.clicked().then(|| resp.interact_pointer_pos()).flatten() {
+            self.action = Action::Duplicate(node, pos);
+        }
     }
 }
 
@@ -601,6 +606,9 @@ impl eframe::App for App {
                     } else {
                         self.alert("Failed to compute".to_owned());
                     }
+                }
+                Action::Duplicate(node, pos) => {
+                    self.chart.insert_node(pos, self.chart[node].clone());
                 }
             }
         });
