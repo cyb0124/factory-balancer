@@ -502,6 +502,7 @@ impl App {
                     let false = key.is_empty() else { continue };
                     keys.push(key.to_owned());
                 }
+                keys.sort_unstable();
                 return Ok(self.show_storage_key_list(keys));
             }
             let key = format!("{STORAGE_PREFIX}{}", self.storage_key);
