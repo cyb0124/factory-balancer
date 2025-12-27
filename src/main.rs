@@ -124,7 +124,7 @@ impl ChartStats {
                             let Ok(qty) = eval_str(qty) else { return (0., status = ProcessStatus::Invalid).0 };
                             let rate = rate * qty;
                             let adj = <[OutPinId; 1]>::try_from(chart.in_pin(InPinId { node, input }).remotes);
-                            let Ok([adj]) = adj else { return (0., status = ProcessStatus::Invalid).0 };
+                            let Ok([adj]) = adj else { return (rate, status = ProcessStatus::Invalid).0 };
                             let stats = this.resource_mut(resolve_ref(chart, adj.node));
                             (stats.dec += rate, stats.net -= rate);
                             rate
@@ -133,7 +133,7 @@ impl ChartStats {
                             let Ok(qty) = eval_str(qty) else { return (0., status = ProcessStatus::Invalid).0 };
                             let rate = rate * qty;
                             let adj = <[InPinId; 1]>::try_from(chart.out_pin(OutPinId { node, output }).remotes);
-                            let Ok([adj]) = adj else { return (0., status = ProcessStatus::Invalid).0 };
+                            let Ok([adj]) = adj else { return (rate, status = ProcessStatus::Invalid).0 };
                             let stats = this.resource_mut(resolve_ref(chart, adj.node));
                             (stats.inc += rate, stats.net += rate);
                             rate
@@ -244,6 +244,35 @@ fn prepare_small_button(ui: &mut Ui) {
     let spacing = &mut ui.style_mut().spacing;
     spacing.button_padding = Vec2::ZERO;
     spacing.item_spacing = vec2(1., 0.);
+}
+
+fn process_pin_tooltip(ui: &mut Ui, chart: &Snarl<NodeMeta>, stats: &ChartStats, node: NodeId, is_output: bool, slot: usize, peer: Option<NodeId>) {
+    let Some(pos) = ui.input(|x| x.pointer.hover_pos()) else { return };
+    let rect = ui.min_rect().intersect(ui.clip_rect());
+    let rect = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(rect, |t| t * rect);
+    let true = rect.contains(pos) else { return };
+    let mut msg = String::new();
+    if let Some(peer) = peer {
+        msg.clone_from(match &chart[peer] {
+            NodeMeta::Resource(meta) => &meta.label,
+            NodeMeta::Reference(root) => {
+                let NodeMeta::Resource(meta) = &chart[*root] else { unreachable!() };
+                &meta.label
+            }
+            NodeMeta::Process(_) => unreachable!(),
+        });
+    }
+    let Some(NodeStats::Process(stats)) = stats.nodes.get(&node) else { unreachable!() };
+    if let Some(rate) = if is_output { &stats.output_rates } else { &stats.input_rates }.get(slot) {
+        (!msg.is_empty()).then(|| msg += ": ");
+        msg += &format_float(*rate, THRESHOLD);
+    }
+    if !msg.is_empty() {
+        Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(if is_output { RectAlign::RIGHT } else { RectAlign::LEFT }).show(|ui| {
+            ui.set_max_width(TOOLTIP_WIDTH);
+            ui.label(msg);
+        });
+    }
 }
 
 impl SnarlViewer<NodeMeta> for ChartViewer {
@@ -363,34 +392,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     ui.small_button("➡").clicked().then(|| self.action = Action::FitActivityToInput(pin.id));
                 });
             });
-        }
-        if let Some(NodeStats::Process(stats)) = self.stats.nodes.get(&pin.id.node)
-            && let Some(pos) = ui.input(|x| x.pointer.hover_pos())
-            && let rect = ui.min_rect().intersect(ui.clip_rect())
-            && let rect = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(rect, |t| t * rect)
-            && rect.contains(pos)
-        {
-            let mut msg = String::new();
-            if pin.remotes.len() == 1 {
-                msg.clone_from(match &chart[pin.remotes[0].node] {
-                    NodeMeta::Resource(meta) => &meta.label,
-                    NodeMeta::Reference(root) => {
-                        let NodeMeta::Resource(meta) = &chart[*root] else { unreachable!() };
-                        &meta.label
-                    }
-                    NodeMeta::Process(_) => unreachable!(),
-                });
-            }
-            if let Some(rate) = stats.input_rates.get(pin.id.input) {
-                (!msg.is_empty()).then(|| msg += ": ");
-                msg += &format_float(*rate, THRESHOLD);
-            }
-            if !msg.is_empty() {
-                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::LEFT).show(|ui| {
-                    ui.set_max_width(TOOLTIP_WIDTH);
-                    ui.label(msg);
-                });
-            }
+            process_pin_tooltip(ui, chart, &self.stats, pin.id.node, false, pin.id.input, pin.remotes.first().map(|x| x.node));
         }
         PinInfo::square()
     }
@@ -414,34 +416,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     ui.small_button("✖").clicked().then(|| self.action = Action::RemoveOutput(pin.id));
                 });
             });
-        }
-        if let Some(NodeStats::Process(stats)) = self.stats.nodes.get(&pin.id.node)
-            && let Some(pos) = ui.input(|x| x.pointer.hover_pos())
-            && let rect = ui.min_rect().intersect(ui.clip_rect())
-            && let rect = ui.ctx().layer_transform_to_global(ui.layer_id()).map_or(rect, |t| t * rect)
-            && rect.contains(pos)
-        {
-            let mut msg = String::new();
-            if pin.remotes.len() == 1 {
-                msg.clone_from(match &chart[pin.remotes[0].node] {
-                    NodeMeta::Resource(meta) => &meta.label,
-                    NodeMeta::Reference(root) => {
-                        let NodeMeta::Resource(meta) = &chart[*root] else { unreachable!() };
-                        &meta.label
-                    }
-                    NodeMeta::Process(_) => unreachable!(),
-                });
-            }
-            if let Some(rate) = stats.output_rates.get(pin.id.output) {
-                (!msg.is_empty()).then(|| msg += ": ");
-                msg += &format_float(*rate, THRESHOLD);
-            }
-            if !msg.is_empty() {
-                Popup::new(ui.id(), ui.ctx().clone(), rect, ui.layer_id()).align(RectAlign::RIGHT).show(|ui| {
-                    ui.set_max_width(TOOLTIP_WIDTH);
-                    ui.label(msg);
-                });
-            }
+            process_pin_tooltip(ui, chart, &self.stats, pin.id.node, true, pin.id.output, pin.remotes.first().map(|x| x.node));
         }
         PinInfo::square()
     }
