@@ -1,6 +1,6 @@
 mod format;
 
-use crate::format::format_float;
+use crate::format::{format_float, format_float_nz};
 use anyhow::{Context as _, Result, anyhow, ensure};
 use eframe::egui::{Align, CentralPanel, Color32, Context, Frame, Key, Modal, Popup, Pos2, RectAlign, TextWrapMode, Ui, Vec2, vec2};
 use eframe::egui::{KeyboardShortcut, Layout, Modifiers, TextEdit, ThemePreference, TopBottomPanel};
@@ -162,10 +162,11 @@ impl ChartStats {
 
 impl ResourceStats {
     fn show(&self, ui: &mut Ui) {
-        let inc = format_float(self.inc, THRESHOLD);
-        let dec = format_float(self.dec, THRESHOLD);
-        let net = format_float(self.net, THRESHOLD);
-        ui.label(format!("➕ {inc}\n➖ {dec}\nNet {net}"));
+        let mut out = String::new();
+        (self.inc.abs() > THRESHOLD).then(|| out += &format!("➕ {}\n", format_float_nz(self.inc)));
+        (self.dec.abs() > THRESHOLD).then(|| out += &format!("➖ {}\n", format_float_nz(self.dec)));
+        out += &format!("Net {}", format_float(self.net, THRESHOLD));
+        ui.label(out);
     }
 }
 
