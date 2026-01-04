@@ -240,12 +240,6 @@ struct ChartViewer {
     stats: ChartStats,
 }
 
-fn prepare_small_button(ui: &mut Ui) {
-    let spacing = &mut ui.style_mut().spacing;
-    spacing.button_padding = Vec2::ZERO;
-    spacing.item_spacing = vec2(1., 0.);
-}
-
 fn process_pin_tooltip(ui: &mut Ui, chart: &Snarl<NodeMeta>, stats: &ChartStats, node: NodeId, is_output: bool, slot: usize, peer: Option<NodeId>) {
     let Some(pos) = ui.input(|x| x.pointer.hover_pos()) else { return };
     let rect = ui.min_rect().intersect(ui.clip_rect());
@@ -275,6 +269,14 @@ fn process_pin_tooltip(ui: &mut Ui, chart: &Snarl<NodeMeta>, stats: &ChartStats,
     }
 }
 
+fn typical_text_edit(ui: &mut Ui, width: f32, text: &mut String) { TextEdit::multiline(text).desired_width(width).desired_rows(1).show(ui); }
+
+fn prepare_small_button(ui: &mut Ui) {
+    let spacing = &mut ui.style_mut().spacing;
+    spacing.button_padding = Vec2::ZERO;
+    spacing.item_spacing = vec2(1., 0.);
+}
+
 impl SnarlViewer<NodeMeta> for ChartViewer {
     fn connect(&mut self, from: &OutPin, to: &InPin, chart: &mut Snarl<NodeMeta>) {
         let allow = match (&chart[from.id.node], &chart[to.id.node]) {
@@ -290,7 +292,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         match &mut chart[node] {
             NodeMeta::Resource(meta) => {
                 ui.set_width(80.);
-                TextEdit::singleline(&mut meta.label).desired_width(f32::INFINITY).show(ui);
+                typical_text_edit(ui, f32::INFINITY, &mut meta.label);
             }
             &mut NodeMeta::Reference(root) => {
                 let NodeMeta::Resource(meta) = &chart[root] else { unreachable!() };
@@ -301,7 +303,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 (!meta.inputs.is_empty()).then(|| width += 36.);
                 (!meta.outputs.is_empty()).then(|| width += 36.);
                 ui.set_width(width);
-                TextEdit::singleline(&mut meta.label).desired_width(f32::INFINITY).show(ui);
+                typical_text_edit(ui, f32::INFINITY, &mut meta.label);
             }
         }
     }
@@ -334,7 +336,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
             NodeMeta::Resource(meta) => {
                 ui.set_width(72.);
                 ui.vertical_centered(|ui| {
-                    meta.use_base_rate.then(|| TextEdit::singleline(&mut meta.base_rate).desired_width(f32::INFINITY).show(ui));
+                    meta.use_base_rate.then(|| typical_text_edit(ui, f32::INFINITY, &mut meta.base_rate));
                     self.stats.resource(node).show(ui);
                 });
             }
@@ -352,7 +354,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Cap");
-                        TextEdit::singleline(&mut meta.capacity).desired_width(f32::INFINITY).show(ui);
+                        typical_text_edit(ui, f32::INFINITY, &mut meta.capacity);
                     });
                     ui.horizontal(|ui| {
                         ui.label("Act");
@@ -360,7 +362,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Spd");
-                        TextEdit::singleline(&mut meta.speed).desired_width(f32::INFINITY).show(ui);
+                        typical_text_edit(ui, f32::INFINITY, &mut meta.speed);
                     });
                     ui.horizontal(|ui| {
                         prepare_small_button(ui);
@@ -385,7 +387,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn show_input(&mut self, pin: &InPin, ui: &mut Ui, chart: &mut Snarl<NodeMeta>) -> impl SnarlPin + 'static {
         if let NodeMeta::Process(meta) = &mut chart[pin.id.node] {
             ui.vertical(|ui| {
-                TextEdit::singleline(&mut meta.inputs[pin.id.input]).desired_width(20.).show(ui);
+                typical_text_edit(ui, 20., &mut meta.inputs[pin.id.input]);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("✖").clicked().then(|| self.action = Action::RemoveInput(pin.id));
@@ -409,7 +411,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         if let NodeMeta::Process(meta) = &mut chart[pin.id.node] {
             ui.set_width(30.);
             ui.vertical(|ui| {
-                TextEdit::singleline(&mut meta.outputs[pin.id.output]).desired_width(20.).show(ui);
+                typical_text_edit(ui, 20., &mut meta.outputs[pin.id.output]);
                 ui.horizontal(|ui| {
                     prepare_small_button(ui);
                     ui.small_button("⬅").clicked().then(|| self.action = Action::FitActivityToOutput(pin.id));
