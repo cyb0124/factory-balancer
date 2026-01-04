@@ -28,7 +28,7 @@ enum NodeMeta {
     Process(ProcessMeta),
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct ResourceMeta {
     label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -37,6 +37,8 @@ struct ResourceMeta {
     use_base_rate: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     refs: BTreeSet<NodeId>,
+    #[serde(default, skip_serializing_if = "Not::not")]
+    ignore_excess: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -309,8 +311,9 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         }
     }
 
-    fn node_frame(&mut self, mut frame: Frame, node: NodeId, _: &[InPin], _: &[OutPin], chart: &Snarl<NodeMeta>) -> Frame {
-        let Some(stats) = self.stats.nodes.get(&resolve_ref(chart, node)) else { return frame };
+    fn node_frame(&mut self, mut frame: Frame, mut node: NodeId, _: &[InPin], _: &[OutPin], chart: &Snarl<NodeMeta>) -> Frame {
+        node = resolve_ref(chart, node);
+        let Some(stats) = self.stats.nodes.get(&node) else { return frame };
         match stats {
             NodeStats::Process(stats) => match stats.status {
                 ProcessStatus::Invalid => frame.fill = Color32::DARK_RED,
@@ -319,11 +322,12 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                 ProcessStatus::Excess => frame.fill = Color32::DARK_GREEN,
             },
             NodeStats::Resource(stats) => {
+                let NodeMeta::Resource(meta) = &chart[node] else { unreachable!() };
                 if stats.invalid {
                     frame.fill = Color32::DARK_RED;
                 } else if stats.net < -THRESHOLD {
                     frame.fill = BROWN;
-                } else if stats.net > THRESHOLD {
+                } else if !meta.ignore_excess && stats.net > THRESHOLD {
                     frame.fill = Color32::DARK_GREEN;
                 }
             }
@@ -427,8 +431,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
     fn has_graph_menu(&mut self, _: Pos2, _: &mut Snarl<NodeMeta>) -> bool { true }
     fn show_graph_menu(&mut self, pos: Pos2, ui: &mut Ui, chart: &mut Snarl<NodeMeta>) {
         ui.button("New Resource").clicked().then(|| {
-            let meta = ResourceMeta { label: String::new(), base_rate: String::new(), use_base_rate: false, refs: BTreeSet::new() };
-            chart.insert_node(pos, NodeMeta::Resource(meta));
+            chart.insert_node(pos, NodeMeta::Resource(<_>::default()));
         });
         ui.button("New Process").clicked().then(|| {
             let meta = ProcessMeta {
@@ -450,6 +453,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         if let NodeMeta::Resource(meta) = &mut chart[node] {
             ui.button("Reference").clicked().then(|| self.action = Action::Reference(node));
             ui.checkbox(&mut meta.use_base_rate, "Enable Base Rate");
+            ui.checkbox(&mut meta.ignore_excess, "Ignore Excess");
         }
     }
 }
