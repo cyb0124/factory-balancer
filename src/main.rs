@@ -38,7 +38,7 @@ struct ResourceMeta {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     refs: BTreeSet<NodeId>,
     #[serde(default, skip_serializing_if = "Not::not")]
-    ignore_excess: bool,
+    alt_excess_color: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -327,8 +327,8 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
                     frame.fill = Color32::DARK_RED;
                 } else if stats.net < -THRESHOLD {
                     frame.fill = BROWN;
-                } else if !meta.ignore_excess && stats.net > THRESHOLD {
-                    frame.fill = Color32::DARK_GREEN;
+                } else if stats.net > THRESHOLD {
+                    frame.fill = if meta.alt_excess_color { Color32::from_rgb(0, 0, 80) } else { Color32::DARK_GREEN };
                 }
             }
         }
@@ -453,7 +453,7 @@ impl SnarlViewer<NodeMeta> for ChartViewer {
         if let NodeMeta::Resource(meta) = &mut chart[node] {
             ui.button("Reference").clicked().then(|| self.action = Action::Reference(node));
             ui.checkbox(&mut meta.use_base_rate, "Enable Base Rate");
-            ui.checkbox(&mut meta.ignore_excess, "Ignore Excess");
+            ui.checkbox(&mut meta.alt_excess_color, "Alt Excess Color");
         }
     }
 }
@@ -698,6 +698,7 @@ fn make_app(cc: &CreationContext) -> App {
         collapsible: Some(false),
         wire_width: Some(3.),
         pin_placement: Some(PinPlacement::Edge),
+        centering: Some(false),
         ..<_>::default()
     };
     App { style, chart: Snarl::new(), modal: None, storage: window().unwrap().local_storage().ok().flatten(), storage_key: String::new() }
